@@ -546,7 +546,15 @@ void *DebuggerThread(void *) {
 
 	posix_spawnattr_t attrs = {};
 	posix_spawnattr_init(&attrs);
-	posix_spawnattr_setflags(&attrs, POSIX_SPAWN_SETSID);
+
+
+#if __GLIBC__ >= 2
+#	if __GLIBC__ == 2 && __GLIBC_MINOR__ >= 26
+		posix_spawnattr_setflags(&attrs, POSIX_SPAWN_SETSID);
+#	else
+#		pragma message("Warning: glibc version too old for POSIX_SPAWN_SETSID")
+#	endif
+#endif
 
 	posix_spawnp((pid_t *) &gdbPID, gdbPath, &actions, &attrs, gdbArgv, environ);
 #endif
