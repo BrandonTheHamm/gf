@@ -41,7 +41,13 @@
 #define UI_MEMMOVE _UIMemmove
 #endif
 
-#if defined(UI_LINUX)
+#ifdef UI_COCOA
+#import <Foundation/Foundation.h>
+#import <Cocoa/Cocoa.h>
+#import <Carbon/Carbon.h>
+#endif
+
+#if defined(UI_LINUX) || defined(UI_COCOA)
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -56,7 +62,7 @@
 #define UI_CLOCK _UIClock
 #define UI_CLOCKS_PER_SECOND 1000
 #define UI_CLOCK_T clock_t
-#define UI_MEMMOVE memmove
+#define UI_MEMMOVE(d, s, n) do { size_t _n = n; if (_n) { memmove(d, s, _n); } } while (0)
 #endif
 
 #if defined(UI_ESSENCE)
@@ -388,6 +394,7 @@ extern const int UI_KEYCODE_TAB;
 extern const int UI_KEYCODE_UP;
 extern const int UI_KEYCODE_INSERT;
 extern const int UI_KEYCODE_0;
+extern const int UI_KEYCODE_BACKTICK;
 
 #define UI_KEYCODE_LETTER(x) (UI_KEYCODE_A + (x) - 'A')
 #define UI_KEYCODE_DIGIT(x) (UI_KEYCODE_0 + (x) - '0')
@@ -421,7 +428,7 @@ typedef struct UIElement {
 	struct UIWindow *window;
 
 	UIRectangle bounds, clip;
-	
+
 	void *cp; // Context pointer (for user).
 
 	int (*messageClass)(struct UIElement *element, UIMessage message, int di /* data integer */, void *dp /* data pointer */);
@@ -457,9 +464,9 @@ typedef struct UIWindow {
 	int cursorX, cursorY;
 	int cursorStyle;
 
-	// Set when a textbox is modified. 
+	// Set when a textbox is modified.
 	// Useful for tracking whether changes to the loaded document have been saved.
-	bool textboxModifiedFlag; 
+	bool textboxModifiedFlag;
 
 	bool ctrl, shift, alt;
 
@@ -486,6 +493,11 @@ typedef struct UIWindow {
 	EsWindow *window;
 	EsElement *canvas;
 	int cursor;
+#endif
+
+#ifdef UI_COCOA
+	NSWindow *window;
+	void *view;
 #endif
 } UIWindow;
 
@@ -567,8 +579,9 @@ typedef struct UICodeLine {
 
 typedef struct UICode {
 #define UI_CODE_NO_MARGIN (1 << 0)
+#define UI_CODE_H_SCROLL (1 << 1)
 	UIElement e;
-	UIScrollBar *vScroll;
+	UIScrollBar *vScroll, *hScroll;
 	UICodeLine *lines;
 	UIFont *font;
 	int lineCount, focused;
@@ -576,6 +589,7 @@ typedef struct UICode {
 	char *content;
 	size_t contentBytes;
 	int tabSize;
+	int columns;
 } UICode;
 
 typedef struct UIGauge {
@@ -602,7 +616,9 @@ typedef struct UITextbox {
 
 #define UI_MENU_PLACE_ABOVE (1 << 0)
 #define UI_MENU_NO_SCROLL (1 << 1)
-#ifdef UI_ESSENCE
+#if defined(UI_COCOA)
+typedef NSMenu UIMenu;
+#elif defined(UI_ESSENCE)
 typedef EsMenu UIMenu;
 #else
 typedef struct UIMenu {
@@ -650,7 +666,7 @@ typedef struct UIImageDisplay {
 	uint32_t *bits;
 	int width, height;
 	float panX, panY, zoom;
-	
+
 	// Internals:
 	int previousWidth, previousHeight;
 	int previousPanPointX, previousPanPointY;
@@ -668,7 +684,7 @@ typedef struct UISwitcher {
 void UIInitialise();
 int UIMessageLoop();
 
-UIElement *UIElementCreate(size_t bytes, UIElement *parent, uint32_t flags, 
+UIElement *UIElementCreate(size_t bytes, UIElement *parent, uint32_t flags,
 	int (*messageClass)(UIElement *, UIMessage, int, void *), const char *cClassName);
 
 UICheckbox *UICheckboxCreate(UIElement *parent, uint32_t flags, const char *label, ptrdiff_t labelBytes);
@@ -834,9 +850,16 @@ struct {
 
 #ifdef UI_ESSENCE
 	EsInstance *instance;
+#endif
 
+#if defined(UI_ESSENCE) || defined(UI_COCOA)
 	void *menuData[256]; // HACK This limits the number of menu items to 128.
 	uintptr_t menuIndex;
+#endif
+
+#ifdef UI_COCOA
+	int menuX, menuY;
+	UIWindow *menuWindow;
 #endif
 
 #ifdef UI_FREETYPE
@@ -919,7 +942,7 @@ bool _UIMessageLoopSingle(int *result);
 void _UIInspectorRefresh();
 void _UIUpdate();
 
-#ifdef UI_LINUX
+#if defined(UI_LINUX) || defined(UI_COCOA)
 UI_CLOCK_T _UIClock() {
 	struct timespec spec;
 	clock_gettime(CLOCK_REALTIME, &spec);
@@ -1094,11 +1117,11 @@ char *UIStringCopy(const char *in, ptrdiff_t inBytes) {
 	}
 
 	char *buffer = (char *) UI_MALLOC(inBytes + 1);
-	
+
 	for (intptr_t i = 0; i < inBytes; i++) {
 		buffer[i] = in[i];
 	}
-	
+
 	buffer[inBytes] = 0;
 	return buffer;
 }
@@ -1173,7 +1196,7 @@ void UIDrawBlock(UIPainter *painter, UIRectangle rectangle, uint32_t color) {
 			_mm_storeu_si128((__m128i *) bits, color4);
 			bits += 4;
 			count -= 4;
-		} 
+		}
 #endif
 
 		while (count--) {
@@ -1352,7 +1375,7 @@ int UIMeasureStringWidth(const char *string, ptrdiff_t bytes) {
 	if (bytes == -1) {
 		bytes = _UIStringLength(string);
 	}
-	
+
 	return bytes * ui.activeFont->glyphWidth;
 }
 
@@ -1384,7 +1407,7 @@ void UIDrawString(UIPainter *painter, UIRectangle r, const char *string, ptrdiff
 	if (selection) {
 		selectFrom = selection->carets[0];
 		selectTo = selection->carets[1];
-		
+
 		if (selectFrom > selectTo) {
 			UI_SWAP(int, selectFrom, selectTo);
 		}
@@ -1444,22 +1467,22 @@ void UIDrawControlDefault(UIPainter *painter, UIRectangle bounds, uint32_t mode,
 	uint32_t which     = mode & UI_DRAW_CONTROL_TYPE_MASK;
 
 	uint32_t buttonColor = disabled ? ui.theme.buttonDisabled
-		: (pressed && hovered) ? ui.theme.buttonPressed 
-		: (pressed || hovered) ? ui.theme.buttonHovered 
+		: (pressed && hovered) ? ui.theme.buttonPressed
+		: (pressed || hovered) ? ui.theme.buttonHovered
 		: focused ? ui.theme.selected : ui.theme.buttonNormal;
-	uint32_t buttonTextColor = disabled ? ui.theme.textDisabled 
+	uint32_t buttonTextColor = disabled ? ui.theme.textDisabled
 		: buttonColor == ui.theme.selected ? ui.theme.textSelected : ui.theme.text;
 
 	if (which == UI_DRAW_CONTROL_CHECKBOX) {
 		uint32_t color = buttonColor, textColor = buttonTextColor;
 		int midY = (bounds.t + bounds.b) / 2;
-		UIRectangle boxBounds = UI_RECT_4(bounds.l, bounds.l + UI_SIZE_CHECKBOX_BOX, 
+		UIRectangle boxBounds = UI_RECT_4(bounds.l, bounds.l + UI_SIZE_CHECKBOX_BOX,
 				midY - UI_SIZE_CHECKBOX_BOX / 2, midY + UI_SIZE_CHECKBOX_BOX / 2);
 		UIDrawRectangle(painter, boxBounds, color, ui.theme.border, UI_RECT_1(1));
-		UIDrawString(painter, UIRectangleAdd(boxBounds, UI_RECT_4(1, 0, 0, 0)), 
-				checked ? "*" : indeterminate ? "-" : " ", -1, 
+		UIDrawString(painter, UIRectangleAdd(boxBounds, UI_RECT_4(1, 0, 0, 0)),
+				checked ? "*" : indeterminate ? "-" : " ", -1,
 				textColor, UI_ALIGN_CENTER, NULL);
-		UIDrawString(painter, UIRectangleAdd(bounds, UI_RECT_4(UI_SIZE_CHECKBOX_BOX + UI_SIZE_CHECKBOX_GAP, 0, 0, 0)), 
+		UIDrawString(painter, UIRectangleAdd(bounds, UI_RECT_4(UI_SIZE_CHECKBOX_BOX + UI_SIZE_CHECKBOX_GAP, 0, 0, 0)),
 				label, labelBytes, disabled ? ui.theme.textDisabled : ui.theme.text, UI_ALIGN_LEFT, NULL);
 	} else if (which == UI_DRAW_CONTROL_MENU_ITEM || which == UI_DRAW_CONTROL_DROP_DOWN || which == UI_DRAW_CONTROL_PUSH_BUTTON) {
 		uint32_t color = buttonColor, textColor = buttonTextColor;
@@ -1504,13 +1527,13 @@ void UIDrawControlDefault(UIPainter *painter, UIRectangle bounds, uint32_t mode,
 		UIDrawRectangle(painter, bounds, color, ui.theme.border, UI_RECT_1(0));
 
 		if (mode & UI_DRAW_CONTROL_STATE_VERTICAL) {
-			UIDrawGlyph(painter, (bounds.l + bounds.r - ui.activeFont->glyphWidth) / 2 + 1, 
-					isDown ? (bounds.b - ui.activeFont->glyphHeight - 2 * scale) 
-					: (bounds.t + 2 * scale), 
+			UIDrawGlyph(painter, (bounds.l + bounds.r - ui.activeFont->glyphWidth) / 2 + 1,
+					isDown ? (bounds.b - ui.activeFont->glyphHeight - 2 * scale)
+					: (bounds.t + 2 * scale),
 					isDown ? 25 : 24, ui.theme.text);
 		} else {
-			UIDrawGlyph(painter, isDown ? (bounds.r - ui.activeFont->glyphWidth - 2 * scale) 
-					: (bounds.l + 2 * scale), 
+			UIDrawGlyph(painter, isDown ? (bounds.r - ui.activeFont->glyphWidth - 2 * scale)
+					: (bounds.l + 2 * scale),
 					(bounds.t + bounds.b - ui.activeFont->glyphHeight) / 2,
 					isDown ? 26 : 27, ui.theme.text);
 		}
@@ -1533,8 +1556,8 @@ void UIDrawControlDefault(UIPainter *painter, UIRectangle bounds, uint32_t mode,
 		UIRectangle thumb = UI_RECT_4(bounds.l + thumbPosition, bounds.l + thumbPosition + thumbSize, centerY - (thumbSize + 1) / 2, centerY + thumbSize / 2);
 		UIDrawRectangle(painter, thumb, color, ui.theme.border, UI_RECT_1(1));
 	} else if (which == UI_DRAW_CONTROL_TEXTBOX) {
-		UIDrawRectangle(painter, bounds, 
-				disabled ? ui.theme.buttonDisabled : focused ? ui.theme.textboxFocused : ui.theme.textboxNormal, 
+		UIDrawRectangle(painter, bounds,
+				disabled ? ui.theme.buttonDisabled : focused ? ui.theme.textboxFocused : ui.theme.textboxNormal,
 				ui.theme.border, UI_RECT_1(1));
 	} else if (which == UI_DRAW_CONTROL_MODAL_POPUP) {
 		UIRectangle bounds2 = UIRectangleAdd(bounds, UI_RECT_1I(-1));
@@ -1550,7 +1573,7 @@ void UIDrawControlDefault(UIPainter *painter, UIRectangle bounds, uint32_t mode,
 		UIDrawString(painter, bounds, label, labelBytes, textColor, UI_ALIGN_LEFT, NULL);
 	} else if (which == UI_DRAW_CONTROL_TABLE_BACKGROUND) {
 		UIDrawBlock(painter, bounds, ui.theme.panel2);
-		UIDrawRectangle(painter, UI_RECT_4(bounds.l, bounds.r, bounds.t, bounds.t + (int) (UI_SIZE_TABLE_HEADER * scale)), 
+		UIDrawRectangle(painter, UI_RECT_4(bounds.l, bounds.r, bounds.t, bounds.t + (int) (UI_SIZE_TABLE_HEADER * scale)),
 				ui.theme.panel1, ui.theme.border, UI_RECT_4(0, 0, 0, 1));
 	} else if (which == UI_DRAW_CONTROL_TABLE_HEADER) {
 		UIDrawString(painter, bounds, label, labelBytes, ui.theme.text, UI_ALIGN_LEFT, NULL);
@@ -1783,11 +1806,11 @@ int _UIPanelMeasure(UIPanel *panel, int di) {
 	bool horizontal = panel->e.flags & UI_PANEL_HORIZONTAL;
 	int perFill = _UIPanelCalculatePerFill(panel, NULL, horizontal ? di : 0, horizontal ? 0 : di, panel->e.window->scale);
 	int size = 0;
-		
+
 	for (uint32_t i = 0; i < panel->e.childCount; i++) {
 		UIElement *child = panel->e.children[i];
 		if (child->flags & (UI_ELEMENT_HIDE | UI_ELEMENT_NON_CLIENT)) continue;
-		int childSize = UIElementMessage(child, horizontal ? UI_MSG_GET_HEIGHT : UI_MSG_GET_WIDTH, 
+		int childSize = UIElementMessage(child, horizontal ? UI_MSG_GET_HEIGHT : UI_MSG_GET_WIDTH,
 				(child->flags & (horizontal ? UI_ELEMENT_H_FILL : UI_ELEMENT_V_FILL)) ? perFill : 0, 0);
 		if (childSize > size) size = childSize;
 	}
@@ -1816,19 +1839,19 @@ int _UIPanelLayout(UIPanel *panel, UIRectangle bounds, bool measure) {
 		}
 
 		if (horizontal) {
-			int height = ((child->flags & UI_ELEMENT_V_FILL) || expand) ? vSpace 
+			int height = ((child->flags & UI_ELEMENT_V_FILL) || expand) ? vSpace
 				: UIElementMessage(child, UI_MSG_GET_HEIGHT, (child->flags & UI_ELEMENT_H_FILL) ? perFill : 0, 0);
 			int width = (child->flags & UI_ELEMENT_H_FILL) ? perFill : UIElementMessage(child, UI_MSG_GET_WIDTH, height, 0);
-			UIRectangle relative = UI_RECT_4(position, position + width, 
-					scaledBorder2 + (vSpace - height) / 2, 
+			UIRectangle relative = UI_RECT_4(position, position + width,
+					scaledBorder2 + (vSpace - height) / 2,
 					scaledBorder2 + (vSpace + height) / 2);
 			if (!measure) UIElementMove(child, UIRectangleTranslate(relative, bounds), false);
 			position += width + panel->gap * scale;
 		} else {
-			int width = ((child->flags & UI_ELEMENT_H_FILL) || expand) ? hSpace 
+			int width = ((child->flags & UI_ELEMENT_H_FILL) || expand) ? hSpace
 				: UIElementMessage(child, UI_MSG_GET_WIDTH, (child->flags & UI_ELEMENT_V_FILL) ? perFill : 0, 0);
 			int height = (child->flags & UI_ELEMENT_V_FILL) ? perFill : UIElementMessage(child, UI_MSG_GET_HEIGHT, width, 0);
-			UIRectangle relative = UI_RECT_4(scaledBorder2 + (hSpace - width) / 2, 
+			UIRectangle relative = UI_RECT_4(scaledBorder2 + (hSpace - width) / 2,
 					scaledBorder2 + (hSpace + width) / 2, position, position + height);
 			if (!measure) UIElementMove(child, UIRectangleTranslate(relative, bounds), false);
 			position += height + panel->gap * scale;
@@ -1874,7 +1897,7 @@ int _UIPanelMessage(UIElement *element, UIMessage message, int di, void *dp) {
 			UIDrawBlock((UIPainter *) dp, element->bounds, ui.theme.panel1);
 		} else if (element->flags & UI_PANEL_COLOR_2) {
 			UIDrawBlock((UIPainter *) dp, element->bounds, ui.theme.panel2);
-		} 
+		}
 	} else if (message == UI_MSG_MOUSE_WHEEL && panel->scrollBar) {
 		return UIElementMessage(&panel->scrollBar->e, message, di, dp);
 	} else if (message == UI_MSG_SCROLLED) {
@@ -2006,7 +2029,7 @@ int _UIButtonMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	UIButton *button = (UIButton *) element;
 	bool isMenuItem = element->flags & UI_BUTTON_MENU_ITEM;
 	bool isDropDown = element->flags & UI_BUTTON_DROP_DOWN;
-	
+
 	if (message == UI_MSG_GET_HEIGHT) {
 		if (isMenuItem) {
 			return UI_SIZE_MENU_ITEM_HEIGHT * element->window->scale;
@@ -2017,15 +2040,15 @@ int _UIButtonMessage(UIElement *element, UIMessage message, int di, void *dp) {
 		int labelSize = UIMeasureStringWidth(button->label, button->labelBytes);
 		int paddedSize = labelSize + UI_SIZE_BUTTON_PADDING * element->window->scale;
 		if (isDropDown) paddedSize += ui.activeFont->glyphWidth * 2;
-		int minimumSize = ((element->flags & UI_BUTTON_SMALL) ? 0 
-				: isMenuItem ? UI_SIZE_MENU_ITEM_MINIMUM_WIDTH 
-				: UI_SIZE_BUTTON_MINIMUM_WIDTH) 
+		int minimumSize = ((element->flags & UI_BUTTON_SMALL) ? 0
+				: isMenuItem ? UI_SIZE_MENU_ITEM_MINIMUM_WIDTH
+				: UI_SIZE_BUTTON_MINIMUM_WIDTH)
 			* element->window->scale;
 		return paddedSize > minimumSize ? paddedSize : minimumSize;
 	} else if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, 
-				(isMenuItem ? UI_DRAW_CONTROL_MENU_ITEM : isDropDown ? UI_DRAW_CONTROL_DROP_DOWN : UI_DRAW_CONTROL_PUSH_BUTTON) 
-				| ((element->flags & UI_BUTTON_CHECKED) ? UI_DRAW_CONTROL_STATE_CHECKED : 0) | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element), 
+		UIDrawControl((UIPainter *) dp, element->bounds,
+				(isMenuItem ? UI_DRAW_CONTROL_MENU_ITEM : isDropDown ? UI_DRAW_CONTROL_DROP_DOWN : UI_DRAW_CONTROL_PUSH_BUTTON)
+				| ((element->flags & UI_BUTTON_CHECKED) ? UI_DRAW_CONTROL_STATE_CHECKED : 0) | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element),
 				button->label, button->labelBytes, 0, element->window->scale);
 	} else if (message == UI_MSG_UPDATE) {
 		UIElementRepaint(element, NULL);
@@ -2037,7 +2060,7 @@ int _UIButtonMessage(UIElement *element, UIMessage message, int di, void *dp) {
 		}
 	} else if (message == UI_MSG_KEY_TYPED) {
 		UIKeyTyped *m = (UIKeyTyped *) dp;
-		
+
 		if ((m->textBytes == 1 && m->text[0] == ' ') || m->code == UI_KEYCODE_ENTER) {
 			UIElementMessage(element, UI_MSG_CLICKED, 0, 0);
 			UIElementRepaint(element, NULL);
@@ -2067,17 +2090,17 @@ UIButton *UIButtonCreate(UIElement *parent, uint32_t flags, const char *label, p
 
 int _UICheckboxMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	UICheckbox *box = (UICheckbox *) element;
-	
+
 	if (message == UI_MSG_GET_HEIGHT) {
 		return UI_SIZE_BUTTON_HEIGHT * element->window->scale;
 	} else if (message == UI_MSG_GET_WIDTH) {
 		int labelSize = UIMeasureStringWidth(box->label, box->labelBytes);
 		return (labelSize + UI_SIZE_CHECKBOX_BOX + UI_SIZE_CHECKBOX_GAP) * element->window->scale;
 	} else if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, 
-				UI_DRAW_CONTROL_CHECKBOX | (box->check == UI_CHECK_INDETERMINATE ? UI_DRAW_CONTROL_STATE_INDETERMINATE 
-					: box->check == UI_CHECK_CHECKED ? UI_DRAW_CONTROL_STATE_CHECKED : 0) 
-				| UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element), 
+		UIDrawControl((UIPainter *) dp, element->bounds,
+				UI_DRAW_CONTROL_CHECKBOX | (box->check == UI_CHECK_INDETERMINATE ? UI_DRAW_CONTROL_STATE_INDETERMINATE
+					: box->check == UI_CHECK_CHECKED ? UI_DRAW_CONTROL_STATE_CHECKED : 0)
+				| UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element),
 				box->label, box->labelBytes, 0, element->window->scale);
 	} else if (message == UI_MSG_UPDATE) {
 		UIElementRepaint(element, NULL);
@@ -2085,7 +2108,7 @@ int _UICheckboxMessage(UIElement *element, UIMessage message, int di, void *dp) 
 		UI_FREE(box->label);
 	} else if (message == UI_MSG_KEY_TYPED) {
 		UIKeyTyped *m = (UIKeyTyped *) dp;
-		
+
 		if (m->textBytes == 1 && m->text[0] == ' ') {
 			UIElementMessage(element, UI_MSG_CLICKED, 0, 0);
 			UIElementRepaint(element, NULL);
@@ -2111,13 +2134,13 @@ UICheckbox *UICheckboxCreate(UIElement *parent, uint32_t flags, const char *labe
 
 int _UILabelMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	UILabel *label = (UILabel *) element;
-	
+
 	if (message == UI_MSG_GET_HEIGHT) {
 		return UIMeasureStringHeight();
 	} else if (message == UI_MSG_GET_WIDTH) {
 		return UIMeasureStringWidth(label->label, label->labelBytes);
 	} else if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_LABEL | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element), 
+		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_LABEL | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element),
 				label->label, label->labelBytes, 0, element->window->scale);
 	} else if (message == UI_MSG_DEALLOCATE) {
 		UI_FREE(label->label);
@@ -2150,7 +2173,7 @@ int _UISplitterMessage(UIElement *element, UIMessage message, int di, void *dp) 
 	bool vertical = splitPane->e.flags & UI_SPLIT_PANE_VERTICAL;
 
 	if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_SPLITTER | (vertical ? UI_DRAW_CONTROL_STATE_VERTICAL : 0) 
+		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_SPLITTER | (vertical ? UI_DRAW_CONTROL_STATE_VERTICAL : 0)
 				| UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element), NULL, 0, 0, element->window->scale);
 	} else if (message == UI_MSG_GET_CURSOR) {
 		return vertical ? UI_CURSOR_SPLIT_V : UI_CURSOR_SPLIT_H;
@@ -2163,7 +2186,7 @@ int _UISplitterMessage(UIElement *element, UIMessage message, int di, void *dp) 
 		if (splitPane->weight < 0.05f) splitPane->weight = 0.05f;
 		if (splitPane->weight > 0.95f) splitPane->weight = 0.95f;
 
-		if (splitPane->e.children[2]->messageClass == _UISplitPaneMessage 
+		if (splitPane->e.children[2]->messageClass == _UISplitPaneMessage
 				&& (splitPane->e.children[2]->flags & UI_SPLIT_PANE_VERTICAL) == (splitPane->e.flags & UI_SPLIT_PANE_VERTICAL)) {
 			UISplitPane *subSplitPane = (UISplitPane *) splitPane->e.children[2];
 			subSplitPane->weight = (splitPane->weight - oldWeight - subSplitPane->weight + oldWeight * subSplitPane->weight) / (-1 + splitPane->weight);
@@ -2218,7 +2241,7 @@ UISplitPane *UISplitPaneCreate(UIElement *parent, uint32_t flags, float weight) 
 
 int _UITabPaneMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	UITabPane *tabPane = (UITabPane *) element;
-	
+
 	if (message == UI_MSG_PAINT) {
 		UIPainter *painter = (UIPainter *) dp;
 		UIRectangle top = element->bounds;
@@ -2326,7 +2349,7 @@ UITabPane *UITabPaneCreate(UIElement *parent, uint32_t flags, const char *tabs) 
 
 int _UISpacerMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	UISpacer *spacer = (UISpacer *) element;
-	
+
 	if (message == UI_MSG_GET_HEIGHT) {
 		return spacer->height * element->window->scale;
 	} else if (message == UI_MSG_GET_WIDTH) {
@@ -2406,7 +2429,7 @@ int _UIScrollBarMessage(UIElement *element, UIMessage message, int di, void *dp)
 			}
 		}
 	} else if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_SCROLL_TRACK 
+		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_SCROLL_TRACK
 				| ((scrollBar->page >= scrollBar->maximum || scrollBar->maximum <= 0 || scrollBar->page <= 0) ? UI_DRAW_CONTROL_STATE_DISABLED : 0),
 				NULL, 0, 0, element->window->scale);
 	} else if (message == UI_MSG_MOUSE_WHEEL) {
@@ -2424,7 +2447,7 @@ int _UIScrollUpDownMessage(UIElement *element, UIMessage message, int di, void *
 	bool isDown = element->cp;
 
 	if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, (isDown ? UI_DRAW_CONTROL_SCROLL_DOWN : UI_DRAW_CONTROL_SCROLL_UP) 
+		UIDrawControl((UIPainter *) dp, element->bounds, (isDown ? UI_DRAW_CONTROL_SCROLL_DOWN : UI_DRAW_CONTROL_SCROLL_UP)
 				| (scrollBar->horizontal ? 0 : UI_DRAW_CONTROL_STATE_VERTICAL) | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element),
 				NULL, 0, 0, element->window->scale);
 	} else if (message == UI_MSG_UPDATE) {
@@ -2455,15 +2478,15 @@ int _UIScrollThumbMessage(UIElement *element, UIMessage message, int di, void *d
 	UIScrollBar *scrollBar = (UIScrollBar *) element->parent;
 
 	if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_SCROLL_THUMB 
-				| (scrollBar->horizontal ? 0 : UI_DRAW_CONTROL_STATE_VERTICAL) 
+		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_SCROLL_THUMB
+				| (scrollBar->horizontal ? 0 : UI_DRAW_CONTROL_STATE_VERTICAL)
 				| UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element), NULL, 0, 0, element->window->scale);
 	} else if (message == UI_MSG_UPDATE) {
 		UIElementRepaint(element, NULL);
 	} else if (message == UI_MSG_MOUSE_DRAG && element->window->pressedButton == 1) {
 		if (!scrollBar->inDrag) {
 			scrollBar->inDrag = true;
-			
+
 			if (scrollBar->horizontal) {
 				scrollBar->dragOffset = element->bounds.l - scrollBar->e.bounds.l - element->window->cursorX;
 			} else {
@@ -2535,6 +2558,15 @@ int UIDrawStringHighlighted(UIPainter *painter, UIRectangle lineBounds, const ch
 	if (bytes == -1) bytes = _UIStringLength(string);
 	if (bytes > 10000) bytes = 10000;
 
+	typedef enum _UICodeTokenType {
+		UI_CODE_TOKEN_TYPE_DEFAULT,
+		UI_CODE_TOKEN_TYPE_COMMENT,
+		UI_CODE_TOKEN_TYPE_STRING,
+		UI_CODE_TOKEN_TYPE_NUMBER,
+		UI_CODE_TOKEN_TYPE_OPERATOR,
+		UI_CODE_TOKEN_TYPE_PREPROCESSOR,
+	} _UICodeTokenType;
+
 	uint32_t colors[] = {
 		ui.theme.codeDefault,
 		ui.theme.codeComment,
@@ -2547,8 +2579,8 @@ int UIDrawStringHighlighted(UIPainter *painter, UIRectangle lineBounds, const ch
 	int x = lineBounds.l;
 	int y = (lineBounds.t + lineBounds.b - UIMeasureStringHeight()) / 2;
 	int ti = 0;
-	int lexState = 0;
-	bool inComment = false, inIdentifier = false, inChar = false, startedString = false;
+	_UICodeTokenType tokenType = UI_CODE_TOKEN_TYPE_DEFAULT;
+	bool inComment = false, inIdentifier = false, inChar = false, startedString = false, startedPreprocessor = false;
 	uint32_t last = 0;
 
 	while (bytes--) {
@@ -2557,47 +2589,53 @@ int UIDrawStringHighlighted(UIPainter *painter, UIRectangle lineBounds, const ch
 		last <<= 8;
 		last |= c;
 
-		if (lexState == 4) {
-			lexState = 0;
-		} else if (lexState == 1) {
+		if (tokenType == UI_CODE_TOKEN_TYPE_PREPROCESSOR) {
+			if (bytes && c == '/' && (*string == '/' || *string == '*')) {
+				tokenType = UI_CODE_TOKEN_TYPE_DEFAULT;
+			}
+		} else if (tokenType == UI_CODE_TOKEN_TYPE_OPERATOR) {
+			tokenType = UI_CODE_TOKEN_TYPE_DEFAULT;
+		} else if (tokenType == UI_CODE_TOKEN_TYPE_COMMENT) {
 			if ((last & 0xFF0000) == ('*' << 16) && (last & 0xFF00) == ('/' << 8) && inComment) {
-				lexState = 0, inComment = false;
+				tokenType = startedPreprocessor ? UI_CODE_TOKEN_TYPE_PREPROCESSOR : UI_CODE_TOKEN_TYPE_DEFAULT;
+				inComment = false;
 			}
-		} else if (lexState == 3) {
+		} else if (tokenType == UI_CODE_TOKEN_TYPE_NUMBER) {
 			if (!_UICharIsAlpha(c) && !_UICharIsDigit(c)) {
-				lexState = 0;
+				tokenType = UI_CODE_TOKEN_TYPE_DEFAULT;
 			}
-		} else if (lexState == 2) {
+		} else if (tokenType == UI_CODE_TOKEN_TYPE_STRING) {
 			if (!startedString) {
 				if (!inChar && ((last >> 8) & 0xFF) == '"' && ((last >> 16) & 0xFF) != '\\') {
-					lexState = 0;
+					tokenType = UI_CODE_TOKEN_TYPE_DEFAULT;
 				} else if (inChar && ((last >> 8) & 0xFF) == '\'' && ((last >> 16) & 0xFF) != '\\') {
-					lexState = 0;
+					tokenType = UI_CODE_TOKEN_TYPE_DEFAULT;
 				}
 			}
 
 			startedString = false;
 		}
 
-		if (lexState == 0) {
+		if (tokenType == UI_CODE_TOKEN_TYPE_DEFAULT) {
 			if (c == '#') {
-				lexState = 5;
-			} else if (c == '/' && *string == '/') {
-				lexState = 1;
-			} else if (c == '/' && *string == '*') {
-				lexState = 1, inComment = true;
+				tokenType = UI_CODE_TOKEN_TYPE_PREPROCESSOR;
+				startedPreprocessor = true;
+			} else if (bytes && c == '/' && *string == '/') {
+				tokenType = UI_CODE_TOKEN_TYPE_COMMENT;
+			} else if (bytes && c == '/' && *string == '*') {
+				tokenType = UI_CODE_TOKEN_TYPE_COMMENT, inComment = true;
 			} else if (c == '"') {
-				lexState = 2;
+				tokenType = UI_CODE_TOKEN_TYPE_STRING;
 				inChar = false;
 				startedString = true;
 			} else if (c == '\'') {
-				lexState = 2;
+				tokenType = UI_CODE_TOKEN_TYPE_STRING;
 				inChar = true;
 				startedString = true;
 			} else if (_UICharIsDigit(c) && !inIdentifier) {
-				lexState = 3;
+				tokenType = UI_CODE_TOKEN_TYPE_NUMBER;
 			} else if (!_UICharIsAlpha(c) && !_UICharIsDigit(c)) {
-				lexState = 4;
+				tokenType = UI_CODE_TOKEN_TYPE_OPERATOR;
 				inIdentifier = false;
 			} else {
 				inIdentifier = true;
@@ -2608,7 +2646,7 @@ int UIDrawStringHighlighted(UIPainter *painter, UIRectangle lineBounds, const ch
 			x += ui.activeFont->glyphWidth, ti++;
 			while (ti % tabSize) x += ui.activeFont->glyphWidth, ti++;
 		} else {
-			UIDrawGlyph(painter, x, y, c, colors[lexState]);
+			UIDrawGlyph(painter, x, y, c, colors[tokenType]);
 			x += ui.activeFont->glyphWidth, ti++;
 		}
 	}
@@ -2618,7 +2656,7 @@ int UIDrawStringHighlighted(UIPainter *painter, UIRectangle lineBounds, const ch
 
 int _UICodeMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	UICode *code = (UICode *) element;
-	
+
 	if (message == UI_MSG_LAYOUT) {
 		UIFont *previousFont = UIFontActivate(code->font);
 
@@ -2630,8 +2668,22 @@ int _UICodeMessage(UIElement *element, UIMessage message, int di, void *dp) {
 		scrollBarBounds.l = scrollBarBounds.r - UI_SIZE_SCROLL_BAR * code->e.window->scale;
 		code->vScroll->maximum = code->lineCount * UIMeasureStringHeight();
 		code->vScroll->page = UI_RECT_HEIGHT(element->bounds);
-		UIFontActivate(previousFont);
+
+		if (code->hScroll) {
+			UIRectangle hScrollBarBounds = element->bounds;
+			if (~code->e.flags & UI_CODE_NO_MARGIN) hScrollBarBounds.l += UI_SIZE_CODE_MARGIN + UI_SIZE_CODE_MARGIN_GAP;
+			hScrollBarBounds.r -= UI_SIZE_SCROLL_BAR * code->e.window->scale;
+			hScrollBarBounds.t = hScrollBarBounds.b - UI_SIZE_SCROLL_BAR * code->e.window->scale;
+			code->hScroll->maximum = code->columns * code->font->glyphWidth;
+			code->hScroll->page = UI_RECT_WIDTH(element->bounds) - UI_SIZE_SCROLL_BAR * code->e.window->scale;
+			code->vScroll->page -= UI_SIZE_SCROLL_BAR * code->e.window->scale;
+			scrollBarBounds.b -= UI_SIZE_SCROLL_BAR * code->e.window->scale;
+			if (~code->e.flags & UI_CODE_NO_MARGIN) code->hScroll->page -= UI_SIZE_CODE_MARGIN + UI_SIZE_CODE_MARGIN_GAP;
+			UIElementMove(&code->hScroll->e, hScrollBarBounds, true);
+		}
+
 		UIElementMove(&code->vScroll->e, scrollBarBounds, true);
+		UIFontActivate(previousFont);
 	} else if (message == UI_MSG_PAINT) {
 		UIFont *previousFont = UIFontActivate(code->font);
 
@@ -2682,10 +2734,15 @@ int _UICodeMessage(UIElement *element, UIMessage message, int di, void *dp) {
 				UIDrawBlock(painter, lineBounds, ui.theme.codeFocused);
 			}
 
+			UIRectangle oldClip = painter->clip;
+			painter->clip = UIRectangleIntersection(oldClip, lineBounds);
+			if (code->hScroll) lineBounds.l -= (int64_t) code->hScroll->position;
 			int x = UIDrawStringHighlighted(painter, lineBounds, code->content + code->lines[i].offset, code->lines[i].bytes, code->tabSize);
 			int y = (lineBounds.t + lineBounds.b - UIMeasureStringHeight()) / 2;
+			if (code->hScroll) lineBounds.l += (int64_t) code->hScroll->position;
+			painter->clip = oldClip;
 
-			UICodeDecorateLine m = { 0 };
+			UICodeDecorateLine m;
 			m.x = x, m.y = y, m.bounds = lineBounds, m.index = i + 1, m.painter = painter;
 			UIElementMessage(element, UI_MSG_CODE_DECORATE_LINE, 0, &m);
 
@@ -2734,6 +2791,7 @@ void UICodeInsertContent(UICode *code, const char *content, ptrdiff_t byteCount,
 		code->lines = NULL;
 		code->contentBytes = 0;
 		code->lineCount = 0;
+		code->columns = 0;
 	}
 
 	code->content = (char *) UI_REALLOC(code->content, code->contentBytes + byteCount);
@@ -2760,6 +2818,7 @@ void UICodeInsertContent(UICode *code, const char *content, ptrdiff_t byteCount,
 			UICodeLine line = { 0 };
 			line.offset = offset + code->contentBytes;
 			line.bytes = i - offset;
+			if (line.bytes > code->columns) code->columns = line.bytes;
 			code->lines[code->lineCount + lineIndex] = line;
 			lineIndex++;
 			offset = i + 1;
@@ -2783,6 +2842,7 @@ UICode *UICodeCreate(UIElement *parent, uint32_t flags) {
 	code->vScroll = UIScrollBarCreate(&code->e, 0);
 	code->focused = -1;
 	code->tabSize = 4;
+	if (flags & UI_CODE_H_SCROLL) code->hScroll = UIScrollBarCreate(&code->e, UI_SCROLL_BAR_HORIZONTAL);
 	return code;
 }
 
@@ -2798,7 +2858,7 @@ int _UIGaugeMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	} else if (message == UI_MSG_GET_WIDTH) {
 		return UI_SIZE_GAUGE_WIDTH * element->window->scale;
 	} else if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_GAUGE | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element), 
+		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_GAUGE | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element),
 				NULL, 0, gauge->position, element->window->scale);
 	}
 
@@ -2827,7 +2887,7 @@ int _UISliderMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	} else if (message == UI_MSG_GET_WIDTH) {
 		return UI_SIZE_SLIDER_WIDTH * element->window->scale;
 	} else if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_SLIDER | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element), 
+		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_SLIDER | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element),
 				NULL, 0, slider->position, element->window->scale);
 	} else if (message == UI_MSG_LEFT_DOWN || (message == UI_MSG_MOUSE_DRAG && element->window->pressedButton == 1)) {
 		UIRectangle bounds = element->bounds;
@@ -2976,14 +3036,14 @@ int _UITableMessage(UIElement *element, UIMessage message, int di, void *dp) {
 		row.t -= (int64_t) table->vScroll->position % rowHeight;
 		int hovered = UITableHitTest(table, element->window->cursorX, element->window->cursorY);
 		UIRectangle oldClip = painter->clip;
-		painter->clip = UIRectangleIntersection(oldClip, UI_RECT_4(bounds.l, bounds.r, 
+		painter->clip = UIRectangleIntersection(oldClip, UI_RECT_4(bounds.l, bounds.r,
 					bounds.t + (int) (UI_SIZE_TABLE_HEADER * element->window->scale), bounds.b));
 
 		for (int i = table->vScroll->position / rowHeight; i < table->itemCount; i++) {
 			if (row.t > painter->clip.b) {
 				break;
 			}
-			
+
 			row.b = row.t + rowHeight;
 			m.index = i;
 			m.isSelected = false;
@@ -3025,7 +3085,7 @@ int _UITableMessage(UIElement *element, UIMessage message, int di, void *dp) {
 				for (; table->columns[end] != '\t' && table->columns[end]; end++);
 
 				header.r = header.l + table->columnWidths[index];
-				UIDrawControl(painter, header, UI_DRAW_CONTROL_TABLE_HEADER | (index == table->columnHighlight ? UI_DRAW_CONTROL_STATE_SELECTED : 0), 
+				UIDrawControl(painter, header, UI_DRAW_CONTROL_TABLE_HEADER | (index == table->columnHighlight ? UI_DRAW_CONTROL_STATE_SELECTED : 0),
 						table->columns + position, end - position, 0, element->window->scale);
 				header.l += table->columnWidths[index] + UI_SIZE_TABLE_COLUMN_GAP * table->e.window->scale;
 
@@ -3071,7 +3131,7 @@ UITable *UITableCreate(UIElement *parent, uint32_t flags, const char *columns) {
 
 char *UITextboxToCString(UITextbox *textbox) {
 	char *buffer = (char *) UI_MALLOC(textbox->bytes + 1);
-	
+
 	for (intptr_t i = 0; i < textbox->bytes; i++) {
 		buffer[i] = textbox->string[i];
 	}
@@ -3079,7 +3139,7 @@ char *UITextboxToCString(UITextbox *textbox) {
 	buffer[textbox->bytes] = 0;
 	return buffer;
 }
-					      
+
 void UITextboxReplace(UITextbox *textbox, const char *text, ptrdiff_t bytes, bool sendChangedMessage) {
 	if (bytes == -1) bytes = _UIStringLength(text);
 	int deleteFrom = textbox->carets[0], deleteTo = textbox->carets[1];
@@ -3138,7 +3198,7 @@ int _UITextboxMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	} else if (message == UI_MSG_GET_WIDTH) {
 		return UI_SIZE_TEXTBOX_WIDTH * element->window->scale;
 	} else if (message == UI_MSG_PAINT) {
-		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_TEXTBOX | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element), 
+		UIDrawControl((UIPainter *) dp, element->bounds, UI_DRAW_CONTROL_TEXTBOX | UI_DRAW_CONTROL_STATE_FROM_ELEMENT(element),
 				NULL, 0, 0, element->window->scale);
 
 		int scaledMargin = UI_SIZE_TEXTBOX_MARGIN * element->window->scale;
@@ -3172,8 +3232,8 @@ int _UITextboxMessage(UIElement *element, UIMessage message, int di, void *dp) {
 		selection.colorText = ui.theme.textSelected;
 		textBounds.l -= textbox->scroll;
 
-		UIDrawString((UIPainter *) dp, textBounds, textbox->string, textbox->bytes, 
-			(element->flags & UI_ELEMENT_DISABLED) ? ui.theme.textDisabled : ui.theme.text, UI_ALIGN_LEFT, 
+		UIDrawString((UIPainter *) dp, textBounds, textbox->string, textbox->bytes,
+			(element->flags & UI_ELEMENT_DISABLED) ? ui.theme.textDisabled : ui.theme.text, UI_ALIGN_LEFT,
 			element->window->focused == element ? &selection : NULL);
 	} else if (message == UI_MSG_GET_CURSOR) {
 		return UI_CURSOR_TEXT;
@@ -3218,7 +3278,7 @@ int _UITextboxMessage(UIElement *element, UIMessage message, int di, void *dp) {
 			textbox->carets[0] = textbox->bytes;
 		} else if (m->textBytes && !element->window->alt && !element->window->ctrl && m->text[0] >= 0x20) {
 			UITextboxReplace(textbox, m->text, m->textBytes, true);
-		} else if ((m->code == UI_KEYCODE_LETTER('C') || m->code == UI_KEYCODE_LETTER('X') || m->code == UI_KEYCODE_INSERT) 
+		} else if ((m->code == UI_KEYCODE_LETTER('C') || m->code == UI_KEYCODE_LETTER('X') || m->code == UI_KEYCODE_INSERT)
 				&& element->window->ctrl && !element->window->alt && !element->window->shift) {
 			int   to = textbox->carets[0] > textbox->carets[1] ? textbox->carets[0] : textbox->carets[1];
 			int from = textbox->carets[0] < textbox->carets[1] ? textbox->carets[0] : textbox->carets[1];
@@ -3228,7 +3288,7 @@ int _UITextboxMessage(UIElement *element, UIMessage message, int di, void *dp) {
 				for (int i = from; i < to; i++) pasteText[i - from] = textbox->string[i];
 				_UIClipboardWriteText(element->window, pasteText);
 			}
-			
+
 			if (m->code == UI_KEYCODE_LETTER('X')) {
 				UITextboxReplace(textbox, NULL, 0, true);
 			}
@@ -3278,7 +3338,7 @@ int _UIMDIChildHitTest(UIMDIChild *mdiChild, int x, int y) {
 
 void _UIMDIChildCloseButton(void *_child) {
 	UIElement *child = (UIElement *) _child;
-	
+
 	if (!UIElementMessage(child, UI_MSG_WINDOW_CLOSE, 0, 0)) {
 		UIElementDestroy(child);
 		UIElementRefresh(child->parent);
@@ -3434,29 +3494,29 @@ UIMDIClient *UIMDIClientCreate(UIElement *parent, uint32_t flags) {
 void _UIImageDisplayUpdateViewport(UIImageDisplay *display) {
 	UIRectangle bounds = display->e.bounds;
 	bounds.r -= bounds.l, bounds.b -= bounds.t;
-	
+
 	float minimumZoomX = 1, minimumZoomY = 1;
 	if (display->width  > bounds.r) minimumZoomX = (float) bounds.r / display->width;
 	if (display->height > bounds.b) minimumZoomY = (float) bounds.b / display->height;
 	float minimumZoom = minimumZoomX < minimumZoomY ? minimumZoomX : minimumZoomY;
-	
+
 	if (display->zoom < minimumZoom || (display->e.flags & _UI_IMAGE_DISPLAY_ZOOM_FIT)) {
 		display->zoom = minimumZoom;
 		display->e.flags |= _UI_IMAGE_DISPLAY_ZOOM_FIT;
 	}
-	
+
 	if (display->panX < 0) display->panX = 0;
 	if (display->panY < 0) display->panY = 0;
 	if (display->panX > display->width  - bounds.r / display->zoom) display->panX = display->width  - bounds.r / display->zoom;
 	if (display->panY > display->height - bounds.b / display->zoom) display->panY = display->height - bounds.b / display->zoom;
-	
+
 	if (bounds.r && display->width  * display->zoom <= bounds.r) display->panX = display->width  / 2 - bounds.r / display->zoom / 2;
 	if (bounds.b && display->height * display->zoom <= bounds.b) display->panY = display->height / 2 - bounds.b / display->zoom / 2;
 }
 
 int _UIImageDisplayMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	UIImageDisplay *display = (UIImageDisplay *) element;
-	
+
 	if (message == UI_MSG_GET_HEIGHT) {
 		return display->height;
 	} else if (message == UI_MSG_GET_WIDTH) {
@@ -3465,24 +3525,24 @@ int _UIImageDisplayMessage(UIElement *element, UIMessage message, int di, void *
 		UI_FREE(display->bits);
 	} else if (message == UI_MSG_PAINT) {
 		UIPainter *painter = (UIPainter *) dp;
-		
+
 		int w = UI_RECT_WIDTH(element->bounds), h = UI_RECT_HEIGHT(element->bounds);
 		int x = _UILinearMap(0, display->panX, display->panX + w / display->zoom, 0, w) + element->bounds.l;
 		int y = _UILinearMap(0, display->panY, display->panY + h / display->zoom, 0, h) + element->bounds.t;
-		
+
 		UIRectangle image = UI_RECT_4(x, x + (int) (display->width * display->zoom), y, (int) (y + display->height * display->zoom));
 		UIRectangle bounds = UIRectangleIntersection(painter->clip, UIRectangleIntersection(display->e.bounds, image));
 		if (!UI_RECT_VALID(bounds)) return 0;
-		
+
 		if (display->zoom == 1) {
 			uint32_t *lineStart = (uint32_t *) painter->bits + bounds.t * painter->width + bounds.l;
 			uint32_t *sourceLineStart = display->bits + (bounds.l - image.l) + display->width * (bounds.t - image.t);
-	
+
 			for (int i = 0; i < bounds.b - bounds.t; i++, lineStart += painter->width, sourceLineStart += display->width) {
 				uint32_t *destination = lineStart;
 				uint32_t *source = sourceLineStart;
 				int j = bounds.r - bounds.l;
-	
+
 				do {
 					*destination = *source;
 					destination++;
@@ -3492,10 +3552,10 @@ int _UIImageDisplayMessage(UIElement *element, UIMessage message, int di, void *
 		} else {
 			float zr = 1.0f / display->zoom;
 			uint32_t *destination = (uint32_t *) painter->bits;
-			
+
 			for (int i = bounds.t; i < bounds.b; i++) {
 				int ty = (i - image.t) * zr;
-				
+
 				for (int j = bounds.l; j < bounds.r; j++) {
 					int tx = (j - image.l) * zr;
 					destination[i * painter->width + j] = display->bits[ty * display->width + tx];
@@ -3525,7 +3585,7 @@ int _UIImageDisplayMessage(UIElement *element, UIMessage message, int di, void *
 		display->previousWidth = bounds.r, display->previousHeight = bounds.b;
 		_UIImageDisplayUpdateViewport(display);
 	} else if (message == UI_MSG_GET_CURSOR && (element->flags & UI_IMAGE_DISPLAY_INTERACTIVE)
-			&& (UI_RECT_WIDTH(element->bounds) < display->width * display->zoom 
+			&& (UI_RECT_WIDTH(element->bounds) < display->width * display->zoom
 				|| UI_RECT_HEIGHT(element->bounds) < display->height * display->zoom)) {
 		return UI_CURSOR_HAND;
 	} else if (message == UI_MSG_MOUSE_DRAG) {
@@ -3535,8 +3595,8 @@ int _UIImageDisplayMessage(UIElement *element, UIMessage message, int di, void *
 		display->previousPanPointX = element->window->cursorX;
 		display->previousPanPointY = element->window->cursorY;
 		UIElementRepaint(element, NULL);
-	} else if (message == UI_MSG_LEFT_DOWN) {           
-		display->e.flags &= ~_UI_IMAGE_DISPLAY_ZOOM_FIT;  
+	} else if (message == UI_MSG_LEFT_DOWN) {
+		display->e.flags &= ~_UI_IMAGE_DISPLAY_ZOOM_FIT;
 		display->previousPanPointX = element->window->cursorX;
 		display->previousPanPointY = element->window->cursorY;
 	}
@@ -3804,7 +3864,7 @@ bool _UIMenusClose() {
 	return anyClosed;
 }
 
-#ifndef UI_ESSENCE
+#if !defined(UI_ESSENCE) && !defined(UI_COCOA)
 int _UIMenuItemMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	if (message == UI_MSG_CLICKED) {
 		_UIMenusClose();
@@ -3853,7 +3913,7 @@ int _UIMenuMessage(UIElement *element, UIMessage message, int di, void *dp) {
 
 			if (~child->flags & UI_ELEMENT_NON_CLIENT) {
 				int height = UIElementMessage(child, UI_MSG_GET_HEIGHT, 0, 0);
-				UIElementMove(child, UI_RECT_4(element->bounds.l + 2, element->bounds.r - scrollBarSize - 2, 
+				UIElementMove(child, UI_RECT_4(element->bounds.l + 2, element->bounds.r - scrollBarSize - 2,
 							position, position + height), false);
 				position += height;
 				totalHeight += height;
@@ -4036,7 +4096,6 @@ void UIElementMove(UIElement *element, UIRectangle bounds, bool layout) {
 
 	if (element->flags & UI_ELEMENT_RELAYOUT) {
 		layout = true;
-		element->flags &= ~UI_ELEMENT_RELAYOUT;
 	}
 
 	if (layout) {
@@ -4047,7 +4106,7 @@ void UIElementMove(UIElement *element, UIRectangle bounds, bool layout) {
 		}
 	}
 
-	element->flags &= ~UI_ELEMENT_RELAYOUT_DESCENDENT;
+	element->flags &= ~(UI_ELEMENT_RELAYOUT_DESCENDENT | UI_ELEMENT_RELAYOUT);
 }
 
 void _UIElementPaint(UIElement *element, UIPainter *painter) {
@@ -4347,7 +4406,7 @@ bool _UIWindowInputEvent(UIWindow *window, UIMessage message, int di, void *dp) 
 						if (element->childCount && !(element->flags & (UI_ELEMENT_HIDE | UI_ELEMENT_DISABLED))) {
 							element = window->shift ? element->children[element->childCount - 1] : element->children[0];
 							continue;
-						} 
+						}
 
 						while (element) {
 							UIElement *sibling = _UIElementNextOrPreviousSibling(element, window->shift);
@@ -4358,7 +4417,7 @@ bool _UIWindowInputEvent(UIWindow *window, UIMessage message, int di, void *dp) 
 						if (!element) {
 							element = &window->e;
 						}
-					} while (element != start && ((~element->flags & UI_ELEMENT_TAB_STOP) 
+					} while (element != start && ((~element->flags & UI_ELEMENT_TAB_STOP)
 						|| (element->flags & (UI_ELEMENT_HIDE | UI_ELEMENT_DISABLED))));
 
 					if (~element->flags & UI_ELEMENT_WINDOW) {
@@ -4370,7 +4429,7 @@ bool _UIWindowInputEvent(UIWindow *window, UIMessage message, int di, void *dp) 
 					for (intptr_t i = window->shortcutCount - 1; i >= 0; i--) {
 						UIShortcut *shortcut = window->shortcuts + i;
 
-						if (shortcut->code == m->code && shortcut->ctrl == window->ctrl 
+						if (shortcut->code == m->code && shortcut->ctrl == window->ctrl
 								&& shortcut->shift == window->shift && shortcut->alt == window->alt) {
 							shortcut->invoke(shortcut->cp);
 							handled = true;
@@ -4405,38 +4464,38 @@ bool _UIWindowInputEvent(UIWindow *window, UIMessage message, int di, void *dp) 
 // Public domain.
 
 const uint64_t _uiFont[] = {
-	0x0000000000000000UL, 0x0000000000000000UL, 0xBD8181A5817E0000UL, 0x000000007E818199UL, 0xC3FFFFDBFF7E0000UL, 0x000000007EFFFFE7UL, 0x7F7F7F3600000000UL, 0x00000000081C3E7FUL, 
-	0x7F3E1C0800000000UL, 0x0000000000081C3EUL, 0xE7E73C3C18000000UL, 0x000000003C1818E7UL, 0xFFFF7E3C18000000UL, 0x000000003C18187EUL, 0x3C18000000000000UL, 0x000000000000183CUL, 
-	0xC3E7FFFFFFFFFFFFUL, 0xFFFFFFFFFFFFE7C3UL, 0x42663C0000000000UL, 0x00000000003C6642UL, 0xBD99C3FFFFFFFFFFUL, 0xFFFFFFFFFFC399BDUL, 0x331E4C5870780000UL, 0x000000001E333333UL, 
-	0x3C666666663C0000UL, 0x0000000018187E18UL, 0x0C0C0CFCCCFC0000UL, 0x00000000070F0E0CUL, 0xC6C6C6FEC6FE0000UL, 0x0000000367E7E6C6UL, 0xE73CDB1818000000UL, 0x000000001818DB3CUL, 
-	0x1F7F1F0F07030100UL, 0x000000000103070FUL, 0x7C7F7C7870604000UL, 0x0000000040607078UL, 0x1818187E3C180000UL, 0x0000000000183C7EUL, 0x6666666666660000UL, 0x0000000066660066UL, 
-	0xD8DEDBDBDBFE0000UL, 0x00000000D8D8D8D8UL, 0x6363361C06633E00UL, 0x0000003E63301C36UL, 0x0000000000000000UL, 0x000000007F7F7F7FUL, 0x1818187E3C180000UL, 0x000000007E183C7EUL, 
-	0x1818187E3C180000UL, 0x0000000018181818UL, 0x1818181818180000UL, 0x00000000183C7E18UL, 0x7F30180000000000UL, 0x0000000000001830UL, 0x7F060C0000000000UL, 0x0000000000000C06UL, 
-	0x0303000000000000UL, 0x0000000000007F03UL, 0xFF66240000000000UL, 0x0000000000002466UL, 0x3E1C1C0800000000UL, 0x00000000007F7F3EUL, 0x3E3E7F7F00000000UL, 0x0000000000081C1CUL, 
-	0x0000000000000000UL, 0x0000000000000000UL, 0x18183C3C3C180000UL, 0x0000000018180018UL, 0x0000002466666600UL, 0x0000000000000000UL, 0x36367F3636000000UL, 0x0000000036367F36UL, 
-	0x603E0343633E1818UL, 0x000018183E636160UL, 0x1830634300000000UL, 0x000000006163060CUL, 0x3B6E1C36361C0000UL, 0x000000006E333333UL, 0x000000060C0C0C00UL, 0x0000000000000000UL, 
-	0x0C0C0C0C18300000UL, 0x0000000030180C0CUL, 0x30303030180C0000UL, 0x000000000C183030UL, 0xFF3C660000000000UL, 0x000000000000663CUL, 0x7E18180000000000UL, 0x0000000000001818UL, 
-	0x0000000000000000UL, 0x0000000C18181800UL, 0x7F00000000000000UL, 0x0000000000000000UL, 0x0000000000000000UL, 0x0000000018180000UL, 0x1830604000000000UL, 0x000000000103060CUL, 
-	0xDBDBC3C3663C0000UL, 0x000000003C66C3C3UL, 0x1818181E1C180000UL, 0x000000007E181818UL, 0x0C183060633E0000UL, 0x000000007F630306UL, 0x603C6060633E0000UL, 0x000000003E636060UL, 
-	0x7F33363C38300000UL, 0x0000000078303030UL, 0x603F0303037F0000UL, 0x000000003E636060UL, 0x633F0303061C0000UL, 0x000000003E636363UL, 0x18306060637F0000UL, 0x000000000C0C0C0CUL, 
-	0x633E6363633E0000UL, 0x000000003E636363UL, 0x607E6363633E0000UL, 0x000000001E306060UL, 0x0000181800000000UL, 0x0000000000181800UL, 0x0000181800000000UL, 0x000000000C181800UL, 
-	0x060C183060000000UL, 0x000000006030180CUL, 0x00007E0000000000UL, 0x000000000000007EUL, 0x6030180C06000000UL, 0x00000000060C1830UL, 0x18183063633E0000UL, 0x0000000018180018UL, 
-	0x7B7B63633E000000UL, 0x000000003E033B7BUL, 0x7F6363361C080000UL, 0x0000000063636363UL, 0x663E6666663F0000UL, 0x000000003F666666UL, 0x03030343663C0000UL, 0x000000003C664303UL, 
-	0x66666666361F0000UL, 0x000000001F366666UL, 0x161E1646667F0000UL, 0x000000007F664606UL, 0x161E1646667F0000UL, 0x000000000F060606UL, 0x7B030343663C0000UL, 0x000000005C666363UL, 
-	0x637F636363630000UL, 0x0000000063636363UL, 0x18181818183C0000UL, 0x000000003C181818UL, 0x3030303030780000UL, 0x000000001E333333UL, 0x1E1E366666670000UL, 0x0000000067666636UL, 
-	0x06060606060F0000UL, 0x000000007F664606UL, 0xC3DBFFFFE7C30000UL, 0x00000000C3C3C3C3UL, 0x737B7F6F67630000UL, 0x0000000063636363UL, 0x63636363633E0000UL, 0x000000003E636363UL, 
-	0x063E6666663F0000UL, 0x000000000F060606UL, 0x63636363633E0000UL, 0x000070303E7B6B63UL, 0x363E6666663F0000UL, 0x0000000067666666UL, 0x301C0663633E0000UL, 0x000000003E636360UL, 
-	0x18181899DBFF0000UL, 0x000000003C181818UL, 0x6363636363630000UL, 0x000000003E636363UL, 0xC3C3C3C3C3C30000UL, 0x00000000183C66C3UL, 0xDBC3C3C3C3C30000UL, 0x000000006666FFDBUL, 
-	0x18183C66C3C30000UL, 0x00000000C3C3663CUL, 0x183C66C3C3C30000UL, 0x000000003C181818UL, 0x0C183061C3FF0000UL, 0x00000000FFC38306UL, 0x0C0C0C0C0C3C0000UL, 0x000000003C0C0C0CUL, 
-	0x1C0E070301000000UL, 0x0000000040607038UL, 0x30303030303C0000UL, 0x000000003C303030UL, 0x0000000063361C08UL, 0x0000000000000000UL, 0x0000000000000000UL, 0x0000FF0000000000UL, 
-	0x0000000000180C0CUL, 0x0000000000000000UL, 0x3E301E0000000000UL, 0x000000006E333333UL, 0x66361E0606070000UL, 0x000000003E666666UL, 0x03633E0000000000UL, 0x000000003E630303UL, 
-	0x33363C3030380000UL, 0x000000006E333333UL, 0x7F633E0000000000UL, 0x000000003E630303UL, 0x060F0626361C0000UL, 0x000000000F060606UL, 0x33336E0000000000UL, 0x001E33303E333333UL, 
-	0x666E360606070000UL, 0x0000000067666666UL, 0x18181C0018180000UL, 0x000000003C181818UL, 0x6060700060600000UL, 0x003C666660606060UL, 0x1E36660606070000UL, 0x000000006766361EUL, 
-	0x18181818181C0000UL, 0x000000003C181818UL, 0xDBFF670000000000UL, 0x00000000DBDBDBDBUL, 0x66663B0000000000UL, 0x0000000066666666UL, 0x63633E0000000000UL, 0x000000003E636363UL, 
-	0x66663B0000000000UL, 0x000F06063E666666UL, 0x33336E0000000000UL, 0x007830303E333333UL, 0x666E3B0000000000UL, 0x000000000F060606UL, 0x06633E0000000000UL, 0x000000003E63301CUL, 
-	0x0C0C3F0C0C080000UL, 0x00000000386C0C0CUL, 0x3333330000000000UL, 0x000000006E333333UL, 0xC3C3C30000000000UL, 0x00000000183C66C3UL, 0xC3C3C30000000000UL, 0x0000000066FFDBDBUL, 
-	0x3C66C30000000000UL, 0x00000000C3663C18UL, 0x6363630000000000UL, 0x001F30607E636363UL, 0x18337F0000000000UL, 0x000000007F63060CUL, 0x180E181818700000UL, 0x0000000070181818UL, 
-	0x1800181818180000UL, 0x0000000018181818UL, 0x18701818180E0000UL, 0x000000000E181818UL, 0x000000003B6E0000UL, 0x0000000000000000UL, 0x63361C0800000000UL, 0x00000000007F6363UL, 
+	0x0000000000000000UL, 0x0000000000000000UL, 0xBD8181A5817E0000UL, 0x000000007E818199UL, 0xC3FFFFDBFF7E0000UL, 0x000000007EFFFFE7UL, 0x7F7F7F3600000000UL, 0x00000000081C3E7FUL,
+	0x7F3E1C0800000000UL, 0x0000000000081C3EUL, 0xE7E73C3C18000000UL, 0x000000003C1818E7UL, 0xFFFF7E3C18000000UL, 0x000000003C18187EUL, 0x3C18000000000000UL, 0x000000000000183CUL,
+	0xC3E7FFFFFFFFFFFFUL, 0xFFFFFFFFFFFFE7C3UL, 0x42663C0000000000UL, 0x00000000003C6642UL, 0xBD99C3FFFFFFFFFFUL, 0xFFFFFFFFFFC399BDUL, 0x331E4C5870780000UL, 0x000000001E333333UL,
+	0x3C666666663C0000UL, 0x0000000018187E18UL, 0x0C0C0CFCCCFC0000UL, 0x00000000070F0E0CUL, 0xC6C6C6FEC6FE0000UL, 0x0000000367E7E6C6UL, 0xE73CDB1818000000UL, 0x000000001818DB3CUL,
+	0x1F7F1F0F07030100UL, 0x000000000103070FUL, 0x7C7F7C7870604000UL, 0x0000000040607078UL, 0x1818187E3C180000UL, 0x0000000000183C7EUL, 0x6666666666660000UL, 0x0000000066660066UL,
+	0xD8DEDBDBDBFE0000UL, 0x00000000D8D8D8D8UL, 0x6363361C06633E00UL, 0x0000003E63301C36UL, 0x0000000000000000UL, 0x000000007F7F7F7FUL, 0x1818187E3C180000UL, 0x000000007E183C7EUL,
+	0x1818187E3C180000UL, 0x0000000018181818UL, 0x1818181818180000UL, 0x00000000183C7E18UL, 0x7F30180000000000UL, 0x0000000000001830UL, 0x7F060C0000000000UL, 0x0000000000000C06UL,
+	0x0303000000000000UL, 0x0000000000007F03UL, 0xFF66240000000000UL, 0x0000000000002466UL, 0x3E1C1C0800000000UL, 0x00000000007F7F3EUL, 0x3E3E7F7F00000000UL, 0x0000000000081C1CUL,
+	0x0000000000000000UL, 0x0000000000000000UL, 0x18183C3C3C180000UL, 0x0000000018180018UL, 0x0000002466666600UL, 0x0000000000000000UL, 0x36367F3636000000UL, 0x0000000036367F36UL,
+	0x603E0343633E1818UL, 0x000018183E636160UL, 0x1830634300000000UL, 0x000000006163060CUL, 0x3B6E1C36361C0000UL, 0x000000006E333333UL, 0x000000060C0C0C00UL, 0x0000000000000000UL,
+	0x0C0C0C0C18300000UL, 0x0000000030180C0CUL, 0x30303030180C0000UL, 0x000000000C183030UL, 0xFF3C660000000000UL, 0x000000000000663CUL, 0x7E18180000000000UL, 0x0000000000001818UL,
+	0x0000000000000000UL, 0x0000000C18181800UL, 0x7F00000000000000UL, 0x0000000000000000UL, 0x0000000000000000UL, 0x0000000018180000UL, 0x1830604000000000UL, 0x000000000103060CUL,
+	0xDBDBC3C3663C0000UL, 0x000000003C66C3C3UL, 0x1818181E1C180000UL, 0x000000007E181818UL, 0x0C183060633E0000UL, 0x000000007F630306UL, 0x603C6060633E0000UL, 0x000000003E636060UL,
+	0x7F33363C38300000UL, 0x0000000078303030UL, 0x603F0303037F0000UL, 0x000000003E636060UL, 0x633F0303061C0000UL, 0x000000003E636363UL, 0x18306060637F0000UL, 0x000000000C0C0C0CUL,
+	0x633E6363633E0000UL, 0x000000003E636363UL, 0x607E6363633E0000UL, 0x000000001E306060UL, 0x0000181800000000UL, 0x0000000000181800UL, 0x0000181800000000UL, 0x000000000C181800UL,
+	0x060C183060000000UL, 0x000000006030180CUL, 0x00007E0000000000UL, 0x000000000000007EUL, 0x6030180C06000000UL, 0x00000000060C1830UL, 0x18183063633E0000UL, 0x0000000018180018UL,
+	0x7B7B63633E000000UL, 0x000000003E033B7BUL, 0x7F6363361C080000UL, 0x0000000063636363UL, 0x663E6666663F0000UL, 0x000000003F666666UL, 0x03030343663C0000UL, 0x000000003C664303UL,
+	0x66666666361F0000UL, 0x000000001F366666UL, 0x161E1646667F0000UL, 0x000000007F664606UL, 0x161E1646667F0000UL, 0x000000000F060606UL, 0x7B030343663C0000UL, 0x000000005C666363UL,
+	0x637F636363630000UL, 0x0000000063636363UL, 0x18181818183C0000UL, 0x000000003C181818UL, 0x3030303030780000UL, 0x000000001E333333UL, 0x1E1E366666670000UL, 0x0000000067666636UL,
+	0x06060606060F0000UL, 0x000000007F664606UL, 0xC3DBFFFFE7C30000UL, 0x00000000C3C3C3C3UL, 0x737B7F6F67630000UL, 0x0000000063636363UL, 0x63636363633E0000UL, 0x000000003E636363UL,
+	0x063E6666663F0000UL, 0x000000000F060606UL, 0x63636363633E0000UL, 0x000070303E7B6B63UL, 0x363E6666663F0000UL, 0x0000000067666666UL, 0x301C0663633E0000UL, 0x000000003E636360UL,
+	0x18181899DBFF0000UL, 0x000000003C181818UL, 0x6363636363630000UL, 0x000000003E636363UL, 0xC3C3C3C3C3C30000UL, 0x00000000183C66C3UL, 0xDBC3C3C3C3C30000UL, 0x000000006666FFDBUL,
+	0x18183C66C3C30000UL, 0x00000000C3C3663CUL, 0x183C66C3C3C30000UL, 0x000000003C181818UL, 0x0C183061C3FF0000UL, 0x00000000FFC38306UL, 0x0C0C0C0C0C3C0000UL, 0x000000003C0C0C0CUL,
+	0x1C0E070301000000UL, 0x0000000040607038UL, 0x30303030303C0000UL, 0x000000003C303030UL, 0x0000000063361C08UL, 0x0000000000000000UL, 0x0000000000000000UL, 0x0000FF0000000000UL,
+	0x0000000000180C0CUL, 0x0000000000000000UL, 0x3E301E0000000000UL, 0x000000006E333333UL, 0x66361E0606070000UL, 0x000000003E666666UL, 0x03633E0000000000UL, 0x000000003E630303UL,
+	0x33363C3030380000UL, 0x000000006E333333UL, 0x7F633E0000000000UL, 0x000000003E630303UL, 0x060F0626361C0000UL, 0x000000000F060606UL, 0x33336E0000000000UL, 0x001E33303E333333UL,
+	0x666E360606070000UL, 0x0000000067666666UL, 0x18181C0018180000UL, 0x000000003C181818UL, 0x6060700060600000UL, 0x003C666660606060UL, 0x1E36660606070000UL, 0x000000006766361EUL,
+	0x18181818181C0000UL, 0x000000003C181818UL, 0xDBFF670000000000UL, 0x00000000DBDBDBDBUL, 0x66663B0000000000UL, 0x0000000066666666UL, 0x63633E0000000000UL, 0x000000003E636363UL,
+	0x66663B0000000000UL, 0x000F06063E666666UL, 0x33336E0000000000UL, 0x007830303E333333UL, 0x666E3B0000000000UL, 0x000000000F060606UL, 0x06633E0000000000UL, 0x000000003E63301CUL,
+	0x0C0C3F0C0C080000UL, 0x00000000386C0C0CUL, 0x3333330000000000UL, 0x000000006E333333UL, 0xC3C3C30000000000UL, 0x00000000183C66C3UL, 0xC3C3C30000000000UL, 0x0000000066FFDBDBUL,
+	0x3C66C30000000000UL, 0x00000000C3663C18UL, 0x6363630000000000UL, 0x001F30607E636363UL, 0x18337F0000000000UL, 0x000000007F63060CUL, 0x180E181818700000UL, 0x0000000070181818UL,
+	0x1800181818180000UL, 0x0000000018181818UL, 0x18701818180E0000UL, 0x000000000E181818UL, 0x000000003B6E0000UL, 0x0000000000000000UL, 0x63361C0800000000UL, 0x00000000007F6363UL,
 };
 
 void UIDrawGlyph(UIPainter *painter, int x0, int y0, int c, uint32_t color) {
@@ -4467,27 +4526,30 @@ void UIDrawGlyph(UIPainter *painter, int x0, int y0, int c, uint32_t color) {
 			if (y0 + y < painter->clip.t) continue;
 			if (y0 + y >= painter->clip.b) break;
 
-			int width = bitmap->width;
-#ifdef UI_FREETYPE_SUBPIXEL
-			width /= 3;
-#endif
+			int width = bitmap->pixel_mode == FT_PIXEL_MODE_LCD ? bitmap->width / 3 : bitmap->width;
 
 			for (int x = 0; x < width; x++) {
 				if (x0 + x < painter->clip.l) continue;
 				if (x0 + x >= painter->clip.r) break;
 
 				uint32_t *destination = painter->bits + (x0 + x) + (y0 + y) * painter->width;
-				uint32_t original = *destination;
+				uint32_t original = *destination, ra, ga, ba;
 
-#ifdef UI_FREETYPE_SUBPIXEL
-				uint32_t ra = ((uint8_t *) bitmap->buffer)[x * 3 + y * bitmap->pitch + 0];
-				uint32_t ga = ((uint8_t *) bitmap->buffer)[x * 3 + y * bitmap->pitch + 1];
-				uint32_t ba = ((uint8_t *) bitmap->buffer)[x * 3 + y * bitmap->pitch + 2];
-				ra += (ga - ra) / 2, ba += (ga - ba) / 2;
-#else
-				uint32_t ra = ((uint8_t *) bitmap->buffer)[x + y * bitmap->pitch];
-				uint32_t ga = ra, ba = ra;
-#endif
+				if (bitmap->pixel_mode == FT_PIXEL_MODE_LCD) {
+					ra = ((uint8_t *) bitmap->buffer)[x * 3 + y * bitmap->pitch + 0];
+					ga = ((uint8_t *) bitmap->buffer)[x * 3 + y * bitmap->pitch + 1];
+					ba = ((uint8_t *) bitmap->buffer)[x * 3 + y * bitmap->pitch + 2];
+					ra += (ga - ra) / 2, ba += (ga - ba) / 2; // TODO Gamma correct blending!
+				} else if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO) {
+					ra = (((uint8_t *) bitmap->buffer)[(x >> 3) + y * bitmap->pitch] & (0x80 >> (x & 7))) ? 0xFF : 0;
+					ga = ra, ba = ra;
+				} else if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY) {
+					ra = ((uint8_t *) bitmap->buffer)[x + y * bitmap->pitch];
+					ga = ra, ba = ra;
+				} else {
+					ra = ga = ba = 0;
+				}
+
 				uint32_t r2 = (255 - ra) * ((original & 0x000000FF) >> 0);
 				uint32_t g2 = (255 - ga) * ((original & 0x0000FF00) >> 8);
 				uint32_t b2 = (255 - ba) * ((original & 0x00FF0000) >> 16);
@@ -4495,8 +4557,8 @@ void UIDrawGlyph(UIPainter *painter, int x0, int y0, int c, uint32_t color) {
 				uint32_t g1 = ga * ((color & 0x0000FF00) >> 8);
 				uint32_t b1 = ba * ((color & 0x00FF0000) >> 16);
 
-				uint32_t result = 0xFF000000 | (0x00FF0000 & ((b1 + b2) << 8)) 
-					| (0x0000FF00 & ((g1 + g2) << 0)) 
+				uint32_t result = 0xFF000000 | (0x00FF0000 & ((b1 + b2) << 8))
+					| (0x0000FF00 & ((g1 + g2) << 0))
 					| (0x000000FF & ((r1 + r2) >> 8));
 				*destination = result;
 			}
@@ -4532,7 +4594,22 @@ UIFont *UIFontCreate(const char *cPath, uint32_t size) {
 #ifdef UI_FREETYPE
 	if (cPath) {
 		if (!FT_New_Face(ui.ft, cPath, 0, &font->font)) {
-			FT_Set_Char_Size(font->font, 0, size * 64, 100, 100);
+			if (FT_HAS_FIXED_SIZES(font->font) && font->font->num_fixed_sizes) {
+				// Look for the smallest strike that's at least `size`.
+				int j = 0;
+
+				for (int i = 0; i < font->font->num_fixed_sizes; i++) {
+					if ((uint32_t) font->font->available_sizes[i].height >= size
+							&& font->font->available_sizes[i].y_ppem < font->font->available_sizes[j].y_ppem) {
+						j = i;
+					}
+				}
+
+				FT_Set_Pixel_Sizes(font->font, font->font->available_sizes[j].x_ppem / 64, font->font->available_sizes[j].y_ppem / 64);
+			} else {
+				FT_Set_Char_Size(font->font, 0, size * 64, 100, 100);
+			}
+
 			FT_Load_Char(font->font, 'a', FT_LOAD_DEFAULT);
 			font->glyphWidth = font->font->glyph->advance.x / 64;
 			font->glyphHeight = (font->font->size->metrics.ascender - font->font->size->metrics.descender) / 64;
@@ -4541,7 +4618,7 @@ UIFont *UIFontCreate(const char *cPath, uint32_t size) {
 		}
 	}
 #endif
-	
+
 	font->glyphWidth = 9;
 	font->glyphHeight = 16;
 	return font;
@@ -4575,7 +4652,7 @@ UIElement *_UIInspectorFindNthElement(UIElement *element, int *index, int *depth
 	}
 
 	*index = *index - 1;
-	
+
 	for (uint32_t i = 0; i < element->childCount; i++) {
 		UIElement *child = element->children[i];
 
@@ -4734,10 +4811,10 @@ void UIAutomationKeyboardType(const char *string) {
 		window->alt = false;
 		window->shift = (c[0] >= 'A' && c[0] <= 'Z');
 		c[0] = string[i];
-		m.code = (c[0] >= 'A' && c[0] <= 'Z') ? UI_KEYCODE_LETTER(c[0]) 
-			: c[0] == '\n' ? UI_KEYCODE_ENTER 
-			: c[0] == '\t' ? UI_KEYCODE_TAB 
-			: c[0] == ' ' ? UI_KEYCODE_SPACE 
+		m.code = (c[0] >= 'A' && c[0] <= 'Z') ? UI_KEYCODE_LETTER(c[0])
+			: c[0] == '\n' ? UI_KEYCODE_ENTER
+			: c[0] == '\t' ? UI_KEYCODE_TAB
+			: c[0] == ' ' ? UI_KEYCODE_SPACE
 			: (c[0] >= '0' && c[0] <= '9') ? UI_KEYCODE_DIGIT(c[0]) : 0;
 		_UIWindowInputEvent(window, UI_MSG_KEY_TYPED, 0, &m);
 	}
@@ -4849,6 +4926,7 @@ const int UI_KEYCODE_TAB = XK_Tab;
 const int UI_KEYCODE_UP = XK_Up;
 const int UI_KEYCODE_INSERT = XK_Insert;
 const int UI_KEYCODE_0 = XK_0;
+const int UI_KEYCODE_BACKTICK = XK_grave;
 
 int _UIWindowMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	if (message == UI_MSG_DEALLOCATE) {
@@ -4876,10 +4954,10 @@ UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, in
 	XSetWindowAttributes attributes = {};
 	attributes.override_redirect = flags & UI_WINDOW_MENU;
 
-	window->window = XCreateWindow(ui.display, DefaultRootWindow(ui.display), 0, 0, width, height, 0, 0, 
+	window->window = XCreateWindow(ui.display, DefaultRootWindow(ui.display), 0, 0, width, height, 0, 0,
 		InputOutput, CopyFromParent, CWOverrideRedirect, &attributes);
 	if (cTitle) XStoreName(ui.display, window->window, cTitle);
-	XSelectInput(ui.display, window->window, SubstructureNotifyMask | ExposureMask | PointerMotionMask 
+	XSelectInput(ui.display, window->window, SubstructureNotifyMask | ExposureMask | PointerMotionMask
 		| ButtonPressMask | ButtonReleaseMask | KeyPressMask | KeyReleaseMask | StructureNotifyMask
 		| EnterWindowMask | LeaveWindowMask | ButtonMotionMask | KeymapStateMask | FocusChangeMask | PropertyChangeMask);
 
@@ -4963,7 +5041,7 @@ char *_UIClipboardReadTextStart(UIWindow *window, size_t *bytes) {
 		unsigned long size, itemAmount;
 		char *data;
 		int format;
-		XGetWindowProperty(ui.copyEvent.xselection.display, ui.copyEvent.xselection.requestor, ui.copyEvent.xselection.property, 0L, ~0L, 0, 
+		XGetWindowProperty(ui.copyEvent.xselection.display, ui.copyEvent.xselection.requestor, ui.copyEvent.xselection.property, 0L, ~0L, 0,
 				AnyPropertyType, &target, &format, &size, &itemAmount, (unsigned char **) &data);
 
 		// We have to allocate for incremental transfers but we don't have to allocate for non-incremental transfers.
@@ -4994,9 +5072,9 @@ char *_UIClipboardReadTextStart(UIWindow *window, size_t *bytes) {
 					unsigned long chunkSize;
 
 					// Note that this call deletes the property.
-					XGetWindowProperty(ui.display, ui.copyEvent.xproperty.window, ui.copyEvent.xproperty.atom, 0L, ~0L, 
+					XGetWindowProperty(ui.display, ui.copyEvent.xproperty.window, ui.copyEvent.xproperty.atom, 0L, ~0L,
 						True, AnyPropertyType, &target, &format, &chunkSize, &itemAmount, (unsigned char **) &data);
-					
+
 					if (chunkSize == 0) {
 						return fullData;
 					} else {
@@ -5085,7 +5163,7 @@ void _UIX11ResetCursor(UIWindow *window) {
 void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
 	(void) painter;
 
-	XPutImage(ui.display, window->window, DefaultGC(ui.display, 0), window->image, 
+	XPutImage(ui.display, window->window, DefaultGC(ui.display, 0), window->image,
 		UI_RECT_TOP_LEFT(window->updateRegion), UI_RECT_TOP_LEFT(window->updateRegion),
 		UI_RECT_SIZE(window->updateRegion));
 }
@@ -5106,7 +5184,7 @@ void UIMenuShow(UIMenu *menu) {
 		Window child;
 		XTranslateCoordinates(ui.display, screen->root, DefaultRootWindow(ui.display), 0, 0, &x, &y, &child);
 
-		if (menu->pointX >= x && menu->pointX < x + screen->width 
+		if (menu->pointX >= x && menu->pointX < x + screen->width
 				&& menu->pointY >= y && menu->pointY < y + screen->height) {
 			if (menu->pointX + width > x + screen->width) menu->pointX = x + screen->width - width;
 			if (menu->pointY + height > y + screen->height) menu->pointY = y + screen->height - height;
@@ -5204,7 +5282,7 @@ bool _UIProcessEvent(XEvent *event) {
 		window->cursorY = event->xbutton.y;
 
 		if (event->xbutton.button >= 1 && event->xbutton.button <= 3) {
-			_UIWindowInputEvent(window, (UIMessage) ((event->type == ButtonPress ? UI_MSG_LEFT_DOWN : UI_MSG_LEFT_UP) 
+			_UIWindowInputEvent(window, (UIMessage) ((event->type == ButtonPress ? UI_MSG_LEFT_DOWN : UI_MSG_LEFT_UP)
 				+ event->xbutton.button * 2 - 2), 0, 0);
 		} else if (event->xbutton.button == 4) {
 			_UIWindowInputEvent(window, UI_MSG_MOUSE_WHEEL, -72, 0);
@@ -5231,7 +5309,7 @@ bool _UIProcessEvent(XEvent *event) {
 			Status status;
 			// printf("%ld, %s\n", symbol, text);
 			UIKeyTyped m = { 0 };
-			m.textBytes = Xutf8LookupString(window->xic, &event->xkey, text, sizeof(text) - 1, &symbol, &status); 
+			m.textBytes = Xutf8LookupString(window->xic, &event->xkey, text, sizeof(text) - 1, &symbol, &status);
 			m.text = text;
 			m.code = XLookupKeysym(&event->xkey, 0);
 
@@ -5285,7 +5363,7 @@ bool _UIProcessEvent(XEvent *event) {
 			KeySym symbol = NoSymbol;
 			Status status;
 			UIKeyTyped m = { 0 };
-			m.textBytes = Xutf8LookupString(window->xic, &event->xkey, text, sizeof(text) - 1, &symbol, &status); 
+			m.textBytes = Xutf8LookupString(window->xic, &event->xkey, text, sizeof(text) - 1, &symbol, &status);
 			m.text = text;
 			m.code = XLookupKeysym(&event->xkey, 0);
 			_UIWindowInputEvent(window, UI_MSG_KEY_RELEASED, 0, &m);
@@ -5408,7 +5486,7 @@ bool _UIProcessEvent(XEvent *event) {
 		UIWindow *window = _UIFindWindow(event->xclient.window);
 		if (!window) return false;
 
-		if ((XGetSelectionOwner(ui.display, ui.clipboardID) == window->window) 
+		if ((XGetSelectionOwner(ui.display, ui.clipboardID) == window->window)
 				&& (event->xselectionrequest.selection == ui.clipboardID)) {
 			XSelectionRequestEvent requestEvent = event->xselectionrequest;
 			Atom utf8ID = XInternAtom(ui.display, "UTF8_STRING", 1);
@@ -5419,10 +5497,10 @@ bool _UIProcessEvent(XEvent *event) {
 			int changePropertyResult = 0;
 
 			if(requestEvent.target == XA_STRING || requestEvent.target == ui.textID || requestEvent.target == utf8ID) {
-				changePropertyResult = XChangeProperty(requestEvent.display, requestEvent.requestor, requestEvent.property, 
+				changePropertyResult = XChangeProperty(requestEvent.display, requestEvent.requestor, requestEvent.property,
 						type, 8, PropModeReplace, (const unsigned char *) ui.pasteText, strlen(ui.pasteText));
 			} else if (requestEvent.target == ui.targetID) {
-				changePropertyResult = XChangeProperty(requestEvent.display, requestEvent.requestor, requestEvent.property, 
+				changePropertyResult = XChangeProperty(requestEvent.display, requestEvent.requestor, requestEvent.property,
 						XA_ATOM, 32, PropModeReplace, (unsigned char *) &utf8ID, 1);
 			}
 
@@ -5661,16 +5739,16 @@ LRESULT CALLBACK _UIWindowProcedure(HWND hwnd, UINT message, WPARAM wParam, LPAR
 		HDROP drop = (HDROP) wParam;
 		int count = DragQueryFile(drop, 0xFFFFFFFF, NULL, 0);
 		char **files = (char **) UI_MALLOC(sizeof(char *) * count);
-		
+
 		for (int i = 0; i < count; i++) {
 			int length = DragQueryFile(drop, i, NULL, 0);
 			files[i] = (char *) UI_MALLOC(length + 1);
 			files[i][length] = 0;
 			DragQueryFile(drop, i, files[i], length + 1);
 		}
-		
+
 		UIElementMessage(&window->e, UI_MSG_WINDOW_DROP_FILES, count, files);
-		for (int i = 0; i < count; i++) UI_FREE(files[i]);		
+		for (int i = 0; i < count; i++) UI_FREE(files[i]);
 		UI_FREE(files);
 		DragFinish(drop);
 		_UIUpdate();
@@ -5693,7 +5771,7 @@ LRESULT CALLBACK _UIWindowProcedure(HWND hwnd, UINT message, WPARAM wParam, LPAR
 
 void UIInitialise() {
 	ui.heap = GetProcessHeap();
-	
+
 	_UIInitialiseCommon();
 
 	ui.cursors[UI_CURSOR_ARROW] = LoadCursor(NULL, IDC_ARROW);
@@ -5766,10 +5844,10 @@ UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, in
 	if (flags & UI_WINDOW_MENU) {
 		UI_ASSERT(owner);
 
-		window->hwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_NOACTIVATE, "shadow", 0, WS_POPUP, 
+		window->hwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_NOACTIVATE, "shadow", 0, WS_POPUP,
 			0, 0, 0, 0, owner->hwnd, NULL, NULL, NULL);
 	} else {
-		window->hwnd = CreateWindowEx(WS_EX_ACCEPTFILES, "normal", cTitle, WS_OVERLAPPEDWINDOW, 
+		window->hwnd = CreateWindowEx(WS_EX_ACCEPTFILES, "normal", cTitle, WS_OVERLAPPEDWINDOW,
 			CW_USEDEFAULT, CW_USEDEFAULT, width ? width : CW_USEDEFAULT, height ? height : CW_USEDEFAULT,
 			owner ? owner->hwnd : NULL, NULL, NULL, NULL);
 	}
@@ -5790,9 +5868,9 @@ void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
 	info.biSize = sizeof(info);
 	info.biWidth = window->width, info.biHeight = window->height;
 	info.biPlanes = 1, info.biBitCount = 32;
-	StretchDIBits(dc, 
-		UI_RECT_TOP_LEFT(window->updateRegion), UI_RECT_SIZE(window->updateRegion), 
-		window->updateRegion.l, window->updateRegion.b + 1, 
+	StretchDIBits(dc,
+		UI_RECT_TOP_LEFT(window->updateRegion), UI_RECT_SIZE(window->updateRegion),
+		window->updateRegion.l, window->updateRegion.b + 1,
 		UI_RECT_WIDTH(window->updateRegion), -UI_RECT_HEIGHT(window->updateRegion),
 		window->bits, (BITMAPINFO *) &info, DIB_RGB_COLORS, SRCCOPY);
 	ReleaseDC(window->hwnd, dc);
@@ -5848,23 +5926,23 @@ char *_UIClipboardReadTextStart(UIWindow *window, size_t *bytes) {
 	if (!OpenClipboard(window->hwnd)) {
 		return NULL;
 	}
-	
+
 	HANDLE memory = GetClipboardData(CF_TEXT);
-	
+
 	if (!memory) {
 		CloseClipboard();
 		return NULL;
 	}
-	
+
 	char *buffer = (char *) GlobalLock(memory);
-	
+
 	if (!buffer) {
 		CloseClipboard();
 		return NULL;
 	}
-	
+
 	size_t byteCount = GlobalSize(memory);
-	
+
 	if (byteCount < 1) {
 		GlobalUnlock(memory);
 		CloseClipboard();
@@ -5874,10 +5952,10 @@ char *_UIClipboardReadTextStart(UIWindow *window, size_t *bytes) {
 	char *copy = (char *) UI_MALLOC(byteCount + 1);
 	for (uintptr_t i = 0; i < byteCount; i++) copy[i] = buffer[i];
 	copy[byteCount] = 0; // Just in case.
-	
+
 	GlobalUnlock(memory);
 	CloseClipboard();
-	
+
 	if (bytes) *bytes = _UIStringLength(copy);
 	return copy;
 }
@@ -5971,7 +6049,7 @@ void UIMenuAddItem(UIMenu *menu, uint32_t flags, const char *label, ptrdiff_t la
 	EsAssert(ui.menuIndex < 128);
 	ui.menuData[ui.menuIndex * 2 + 0] = (void *) invoke;
 	ui.menuData[ui.menuIndex * 2 + 1] = cp;
-	EsMenuAddItem(menu, (flags & UI_BUTTON_CHECKED) ? ES_MENU_ITEM_CHECKED : ES_FLAGS_DEFAULT, 
+	EsMenuAddItem(menu, (flags & UI_BUTTON_CHECKED) ? ES_MENU_ITEM_CHECKED : ES_FLAGS_DEFAULT,
 			label, labelBytes, _UIMenuItemCallback, ui.menuIndex);
 	ui.menuIndex++;
 }
@@ -5999,7 +6077,7 @@ int _UIWindowCanvasMessage(EsElement *element, EsMessage *message) {
 		_UIWindowInputEvent(window, UI_MSG_MOUSE_WHEEL, -message->scrollWheel.dy, 0);
 	} else if (message->type == ES_MSG_MOUSE_MOVED || message->type == ES_MSG_HOVERED_END
 			|| message->type == ES_MSG_MOUSE_LEFT_DRAG || message->type == ES_MSG_MOUSE_RIGHT_DRAG || message->type == ES_MSG_MOUSE_MIDDLE_DRAG) {
-		EsPoint point = EsMouseGetPosition(element); 
+		EsPoint point = EsMouseGetPosition(element);
 		window->cursorX = point.x, window->cursorY = point.y;
 		_UIWindowInputEvent(window, UI_MSG_MOUSE_MOVE, 0, 0);
 	} else if (message->type == ES_MSG_KEY_UP) {
@@ -6038,7 +6116,7 @@ int _UIWindowCanvasMessage(EsElement *element, EsMessage *message) {
 		if (window->cursor == UI_CURSOR_RESIZE_DOWN_RIGHT) message->cursorStyle = ES_CURSOR_RESIZE_DIAGONAL_1;
 		if (window->cursor == UI_CURSOR_RESIZE_DOWN_LEFT)  message->cursorStyle = ES_CURSOR_RESIZE_DIAGONAL_2;
 	}
-	
+
 	else if (message->type == ES_MSG_MOUSE_LEFT_DOWN)   _UIWindowInputEvent(window, UI_MSG_LEFT_DOWN, 0, 0);
 	else if (message->type == ES_MSG_MOUSE_LEFT_UP)     _UIWindowInputEvent(window, UI_MSG_LEFT_UP, 0, 0);
 	else if (message->type == ES_MSG_MOUSE_MIDDLE_DOWN) _UIWindowInputEvent(window, UI_MSG_MIDDLE_DOWN, 0, 0);
@@ -6105,6 +6183,392 @@ char *_UIClipboardReadTextStart(UIWindow *window, size_t *bytes) {
 
 void _UIClipboardReadTextEnd(UIWindow *window, char *text) {
 	EsHeapFree(text);
+}
+
+#endif
+
+#ifdef UI_COCOA
+
+// TODO Standard keyboard shortcuts (Command+Q, Command+W).
+
+const int UI_KEYCODE_A = -100; // TODO Keyboard layout support.
+const int UI_KEYCODE_F1 = -70;
+const int UI_KEYCODE_0 = -50;
+const int UI_KEYCODE_INSERT = -30;
+
+const int UI_KEYCODE_BACKSPACE = kVK_Delete;
+const int UI_KEYCODE_DELETE = kVK_ForwardDelete;
+const int UI_KEYCODE_DOWN = kVK_DownArrow;
+const int UI_KEYCODE_END = kVK_End;
+const int UI_KEYCODE_ENTER = kVK_Return;
+const int UI_KEYCODE_ESCAPE = kVK_Escape;
+const int UI_KEYCODE_HOME = kVK_Home;
+const int UI_KEYCODE_LEFT = kVK_LeftArrow;
+const int UI_KEYCODE_RIGHT = kVK_RightArrow;
+const int UI_KEYCODE_SPACE = kVK_Space;
+const int UI_KEYCODE_TAB = kVK_Tab;
+const int UI_KEYCODE_UP = kVK_UpArrow;
+const int UI_KEYCODE_BACKTICK = kVK_ANSI_Grave; // TODO Keyboard layout support.
+
+int (*_cocoaAppMain)(int, char **);
+int _cocoaArgc;
+char **_cocoaArgv;
+
+struct _UIPostedMessage {
+	UIMessage message;
+	void *dp;
+};
+
+char *_UIUTF8StringFromNSString(NSString *string) {
+	NSUInteger size = [string lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+	char *buffer = (char *) UI_MALLOC(size + 1);
+	buffer[size] = 0;
+	[string getBytes:buffer maxLength:size usedLength:NULL encoding:NSUTF8StringEncoding options:0 range:NSMakeRange(0, [string length]) remainingRange:NULL];
+	return buffer;
+}
+
+int _UICocoaRemapKey(int code) {
+	if (code == kVK_ANSI_A) { return UI_KEYCODE_LETTER('A'); }
+	if (code == kVK_ANSI_B) { return UI_KEYCODE_LETTER('B'); }
+	if (code == kVK_ANSI_C) { return UI_KEYCODE_LETTER('C'); }
+	if (code == kVK_ANSI_D) { return UI_KEYCODE_LETTER('D'); }
+	if (code == kVK_ANSI_E) { return UI_KEYCODE_LETTER('E'); }
+	if (code == kVK_ANSI_F) { return UI_KEYCODE_LETTER('F'); }
+	if (code == kVK_ANSI_G) { return UI_KEYCODE_LETTER('G'); }
+	if (code == kVK_ANSI_H) { return UI_KEYCODE_LETTER('H'); }
+	if (code == kVK_ANSI_I) { return UI_KEYCODE_LETTER('I'); }
+	if (code == kVK_ANSI_J) { return UI_KEYCODE_LETTER('J'); }
+	if (code == kVK_ANSI_K) { return UI_KEYCODE_LETTER('K'); }
+	if (code == kVK_ANSI_L) { return UI_KEYCODE_LETTER('L'); }
+	if (code == kVK_ANSI_M) { return UI_KEYCODE_LETTER('M'); }
+	if (code == kVK_ANSI_N) { return UI_KEYCODE_LETTER('N'); }
+	if (code == kVK_ANSI_O) { return UI_KEYCODE_LETTER('O'); }
+	if (code == kVK_ANSI_P) { return UI_KEYCODE_LETTER('P'); }
+	if (code == kVK_ANSI_Q) { return UI_KEYCODE_LETTER('Q'); }
+	if (code == kVK_ANSI_R) { return UI_KEYCODE_LETTER('R'); }
+	if (code == kVK_ANSI_S) { return UI_KEYCODE_LETTER('S'); }
+	if (code == kVK_ANSI_T) { return UI_KEYCODE_LETTER('T'); }
+	if (code == kVK_ANSI_U) { return UI_KEYCODE_LETTER('U'); }
+	if (code == kVK_ANSI_V) { return UI_KEYCODE_LETTER('V'); }
+	if (code == kVK_ANSI_W) { return UI_KEYCODE_LETTER('W'); }
+	if (code == kVK_ANSI_X) { return UI_KEYCODE_LETTER('X'); }
+	if (code == kVK_ANSI_Y) { return UI_KEYCODE_LETTER('Y'); }
+	if (code == kVK_ANSI_Z) { return UI_KEYCODE_LETTER('Z'); }
+
+	if (code == kVK_ANSI_0) { return UI_KEYCODE_DIGIT('0'); }
+	if (code == kVK_ANSI_1) { return UI_KEYCODE_DIGIT('1'); }
+	if (code == kVK_ANSI_2) { return UI_KEYCODE_DIGIT('2'); }
+	if (code == kVK_ANSI_3) { return UI_KEYCODE_DIGIT('3'); }
+	if (code == kVK_ANSI_4) { return UI_KEYCODE_DIGIT('4'); }
+	if (code == kVK_ANSI_5) { return UI_KEYCODE_DIGIT('5'); }
+	if (code == kVK_ANSI_6) { return UI_KEYCODE_DIGIT('6'); }
+	if (code == kVK_ANSI_7) { return UI_KEYCODE_DIGIT('7'); }
+	if (code == kVK_ANSI_8) { return UI_KEYCODE_DIGIT('8'); }
+	if (code == kVK_ANSI_9) { return UI_KEYCODE_DIGIT('9'); }
+
+	if (code == kVK_F1)  { return UI_KEYCODE_FKEY( 1); }
+	if (code == kVK_F2)  { return UI_KEYCODE_FKEY( 2); }
+	if (code == kVK_F3)  { return UI_KEYCODE_FKEY( 3); }
+	if (code == kVK_F4)  { return UI_KEYCODE_FKEY( 4); }
+	if (code == kVK_F5)  { return UI_KEYCODE_FKEY( 5); }
+	if (code == kVK_F6)  { return UI_KEYCODE_FKEY( 6); }
+	if (code == kVK_F7)  { return UI_KEYCODE_FKEY( 7); }
+	if (code == kVK_F8)  { return UI_KEYCODE_FKEY( 8); }
+	if (code == kVK_F9)  { return UI_KEYCODE_FKEY( 9); }
+	if (code == kVK_F10) { return UI_KEYCODE_FKEY(10); }
+	if (code == kVK_F11) { return UI_KEYCODE_FKEY(11); }
+	if (code == kVK_F12) { return UI_KEYCODE_FKEY(12); }
+
+	return code;
+}
+
+@interface UICocoaApplicationDelegate : NSObject<NSApplicationDelegate>
+@end
+
+@interface UICocoaWindowDelegate : NSObject<NSWindowDelegate>
+@property (nonatomic) UIWindow *uiWindow;
+@end
+
+@interface UICocoaMainView : NSView
+- (void)handlePostedMessage:(id)message;
+- (void)eventCommon:(NSEvent *)event;
+@property (nonatomic) UIWindow *uiWindow;
+@end
+
+@implementation UICocoaApplicationDelegate
+- (void)applicationWillFinishLaunching:(NSNotification *)notification {
+	int code = _cocoaAppMain(_cocoaArgc, _cocoaArgv);
+	if (code) exit(code);
+}
+@end
+
+@implementation UICocoaWindowDelegate
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+	UIElementMessage(&_uiWindow->e, UI_MSG_WINDOW_ACTIVATE, 0, 0);
+	_UIUpdate();
+}
+
+- (void)windowDidResize:(NSNotification *)notification {
+	_uiWindow->width = ((UICocoaMainView *) _uiWindow->view).frame.size.width;
+	_uiWindow->height = ((UICocoaMainView *) _uiWindow->view).frame.size.height;
+	_uiWindow->bits = (uint32_t *) UI_REALLOC(_uiWindow->bits, _uiWindow->width * _uiWindow->height * 4);
+	_uiWindow->e.bounds = UI_RECT_2S(_uiWindow->width, _uiWindow->height);
+	_uiWindow->e.clip = UI_RECT_2S(_uiWindow->width, _uiWindow->height);
+	UIElementRelayout(&_uiWindow->e);
+	_UIUpdate();
+}
+@end
+
+@implementation UICocoaMainView
+- (void)handlePostedMessage:(id)_message {
+	_UIPostedMessage *message = (_UIPostedMessage *) _message;
+	_UIWindowInputEvent(_uiWindow, message->message, 0, message->dp);
+	UI_FREE(message);
+}
+
+- (BOOL)acceptsFirstResponder {
+	return YES;
+}
+
+- (void)onMenuItemSelected:(NSMenuItem *)menuItem {
+	((void (*)(void *)) ui.menuData[menuItem.tag * 2 + 0])(ui.menuData[menuItem.tag * 2 + 1]);
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+	const unsigned char *data = (const unsigned char *) _uiWindow->bits;
+	NSDrawBitmap(NSMakeRect(0, 0, _uiWindow->width, _uiWindow->height), _uiWindow->width, _uiWindow->height,
+			8 /* bits per channel */, 4 /* channels per pixel */,
+			32 /* bits per pixel */, 4 * _uiWindow->width /* bytes per row */, NO /* planar */, YES /* has alpha */,
+			NSDeviceRGBColorSpace /* color space */, &data /* data */);
+}
+
+- (void)eventCommon:(NSEvent *)event {
+	NSPoint cursor = [self convertPoint:[event locationInWindow] fromView:nil];
+	_uiWindow->cursorX = cursor.x, _uiWindow->cursorY = _uiWindow->height - cursor.y - 1;
+	_uiWindow->ctrl = event.modifierFlags & NSEventModifierFlagCommand;
+	_uiWindow->shift = event.modifierFlags & NSEventModifierFlagShift;
+	_uiWindow->alt = event.modifierFlags & NSEventModifierFlagOption;
+}
+
+- (void)keyDown:(NSEvent *)event {
+	[self eventCommon:event];
+	char *text = _UIUTF8StringFromNSString(event.characters);
+	UIKeyTyped m = { .code = _UICocoaRemapKey(event.keyCode), .text = text, .textBytes = (int) strlen(text) };
+	_UIWindowInputEvent(_uiWindow, UI_MSG_KEY_TYPED, 0, &m);
+	UI_FREE(text);
+}
+
+- (void)keyUp:(NSEvent *)event {
+	[self eventCommon:event];
+	UIKeyTyped m = { .code = _UICocoaRemapKey(event.keyCode) };
+	_UIWindowInputEvent(_uiWindow, UI_MSG_KEY_RELEASED, 0, &m);
+}
+
+- (void)mouseMoved:(NSEvent *)event {
+	[self eventCommon:event];
+	_UIWindowInputEvent(_uiWindow, UI_MSG_MOUSE_MOVE, 0, 0);
+}
+
+- (void)mouseExited:(NSEvent *)event { [self mouseMoved:event]; }
+- (void)flagsChanged:(NSEvent *)event { [self mouseMoved:event]; }
+- (void)mouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
+- (void)rightMouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
+- (void)otherMouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
+
+- (void)mouseDown:(NSEvent *)event {
+	[self eventCommon:event];
+	_UIWindowInputEvent(_uiWindow, UI_MSG_LEFT_DOWN, 0, 0);
+}
+
+- (void)mouseUp:(NSEvent *)event {
+	[self eventCommon:event];
+	_UIWindowInputEvent(_uiWindow, UI_MSG_LEFT_UP, 0, 0);
+}
+
+- (void)rightMouseDown:(NSEvent *)event {
+	[self eventCommon:event];
+	_UIWindowInputEvent(_uiWindow, UI_MSG_RIGHT_DOWN, 0, 0);
+}
+
+- (void)rightMouseUp:(NSEvent *)event {
+	[self eventCommon:event];
+	_UIWindowInputEvent(_uiWindow, UI_MSG_RIGHT_UP, 0, 0);
+}
+
+- (void)otherMouseDown:(NSEvent *)event {
+	[self eventCommon:event];
+	_UIWindowInputEvent(_uiWindow, UI_MSG_MIDDLE_DOWN, 0, 0);
+}
+
+- (void)otherMouseUp:(NSEvent *)event {
+	[self eventCommon:event];
+	_UIWindowInputEvent(_uiWindow, UI_MSG_MIDDLE_UP, 0, 0);
+}
+
+- (void)scrollWheel:(NSEvent *)event {
+	[self eventCommon:event];
+	_UIWindowInputEvent(_uiWindow, UI_MSG_MOUSE_WHEEL, -3 * event.deltaY, 0);
+	_UIWindowInputEvent(_uiWindow, UI_MSG_MOUSE_MOVE, 0, 0);
+}
+
+// TODO Animations.
+// TODO Drag and drop.
+// TODO Reporting window close.
+
+@end
+
+int _UIWindowMessage(UIElement *element, UIMessage message, int di, void *dp) {
+	if (message == UI_MSG_DEALLOCATE) {
+		UIWindow *window = (UIWindow *) element;
+		_UIWindowDestroyCommon(window);
+		[window->window close];
+	}
+
+	return _UIWindowMessageCommon(element, message, di, dp);
+}
+
+UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, int _width, int _height) {
+	_UIMenusClose();
+	UIWindow *window = (UIWindow *) UIElementCreate(sizeof(UIWindow), NULL, flags | UI_ELEMENT_WINDOW, _UIWindowMessage, "Window");
+	_UIWindowAdd(window);
+	if (owner) window->scale = owner->scale;
+
+	NSRect frame = NSMakeRect(0, 0, _width ?: 800, _height ?: 600);
+	NSWindowStyleMask styleMask = NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskTitled;
+	NSWindow *nsWindow = [[NSWindow alloc] initWithContentRect:frame styleMask:styleMask backing:NSBackingStoreBuffered defer:NO];
+	[nsWindow center];
+	[nsWindow setTitle:@(cTitle ?: "untitled")];
+	UICocoaWindowDelegate *delegate = [UICocoaWindowDelegate alloc];
+	[delegate setUiWindow:window];
+	nsWindow.delegate = delegate;
+	UICocoaMainView *view = [UICocoaMainView alloc];
+	window->window = nsWindow;
+	window->view = view;
+	window->width = frame.size.width;
+	window->height = frame.size.height;
+	window->bits = (uint32_t *) UI_REALLOC(window->bits, window->width * window->height * 4);
+	window->e.bounds = UI_RECT_2S(window->width, window->height);
+	window->e.clip = UI_RECT_2S(window->width, window->height);
+	[view setUiWindow:window];
+	[view initWithFrame:frame];
+	nsWindow.contentView = view;
+	[view addTrackingArea:[[NSTrackingArea alloc] initWithRect:frame
+		options:NSTrackingMouseMoved|NSTrackingActiveInKeyWindow|NSTrackingInVisibleRect owner:view userInfo:nil]];
+	[nsWindow setInitialFirstResponder:view];
+	[nsWindow makeKeyAndOrderFront:delegate];
+
+	// TODO UI_WINDOW_MAXIMIZE.
+
+	return window;
+}
+
+void _UIClipboardWriteText(UIWindow *window, char *text) {
+	// TODO Clipboard support.
+}
+
+char *_UIClipboardReadTextStart(UIWindow *window, size_t *bytes) {
+	// TODO Clipboard support.
+	return NULL;
+}
+
+void _UIClipboardReadTextEnd(UIWindow *window, char *text) {
+	UI_FREE(text);
+}
+
+void UIInitialise() {
+	_UIInitialiseCommon();
+}
+
+void _UIWindowSetCursor(UIWindow *window, int cursor) {
+	if      (cursor == UI_CURSOR_TEXT)          [[NSCursor IBeamCursor] set];
+	else if (cursor == UI_CURSOR_SPLIT_V)       [[NSCursor resizeUpDownCursor] set];
+	else if (cursor == UI_CURSOR_SPLIT_H)       [[NSCursor resizeLeftRightCursor] set];
+	else if (cursor == UI_CURSOR_FLIPPED_ARROW) [[NSCursor pointingHandCursor] set];
+	else if (cursor == UI_CURSOR_CROSS_HAIR)    [[NSCursor crosshairCursor] set];
+	else if (cursor == UI_CURSOR_HAND)          [[NSCursor pointingHandCursor] set];
+	else                                        [[NSCursor arrowCursor] set];
+}
+
+void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
+	for (int y = painter->clip.t; y < painter->clip.b; y++) {
+		for (int x = painter->clip.l; x < painter->clip.r; x++) {
+			uint32_t *p = &painter->bits[y * painter->width + x];
+			*p = 0xFF000000 | (*p & 0xFF00) | ((*p & 0xFF0000) >> 16) | ((*p & 0xFF) << 16);
+		}
+	}
+
+	[(UICocoaMainView *)window->view setNeedsDisplayInRect:((UICocoaMainView *)window->view).frame];
+}
+
+void _UIWindowGetScreenPosition(UIWindow *window, int *x, int *y) {
+	NSPoint point = [window->window convertPointToScreen:NSMakePoint(0, 0)];
+	*x = point.x, *y = point.y;
+}
+
+UIMenu *UIMenuCreate(UIElement *parent, uint32_t flags) {
+	// TODO Fix the vertical position.
+
+	if (parent->parent) {
+		UIRectangle screenBounds = UIElementScreenBounds(parent);
+		ui.menuX = screenBounds.l;
+		ui.menuY = screenBounds.b;
+	} else {
+		_UIWindowGetScreenPosition(parent->window, &ui.menuX, &ui.menuY);
+		ui.menuX += parent->window->cursorX;
+		ui.menuY += parent->window->cursorY;
+	}
+
+	ui.menuIndex = 0;
+	ui.menuWindow = parent->window;
+
+	NSMenu *menu = [[NSMenu alloc] init];
+	[menu setAutoenablesItems:NO];
+	return menu;
+}
+
+void UIMenuAddItem(UIMenu *menu, uint32_t flags, const char *label, ptrdiff_t labelBytes, void (*invoke)(void *cp), void *cp) {
+	if (ui.menuIndex == 128) return;
+	ui.menuData[ui.menuIndex * 2 + 0] = (void *) invoke;
+	ui.menuData[ui.menuIndex * 2 + 1] = cp;
+	NSString *title = [[NSString alloc] initWithBytes:label length:(labelBytes == -1 ? strlen(label) : labelBytes) encoding:NSUTF8StringEncoding];
+	NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(onMenuItemSelected:) keyEquivalent:@""];
+	item.tag = ui.menuIndex++;
+	if (flags & UI_BUTTON_CHECKED) [item setState:NSControlStateValueOn];
+	[item setEnabled:((flags & UI_ELEMENT_DISABLED) ? NO : YES)];
+	[item setTarget:(UICocoaMainView *)ui.menuWindow->view];
+	[menu addItem:item];
+	[title release];
+	[item release];
+}
+
+void UIMenuShow(UIMenu *menu) {
+	[menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(ui.menuX, ui.menuY) inView:nil];
+	[menu release];
+}
+
+void UIWindowPack(UIWindow *window, int _width) {
+	int width = _width ? _width : UIElementMessage(window->e.children[0], UI_MSG_GET_WIDTH, 0, 0);
+	int height = UIElementMessage(window->e.children[0], UI_MSG_GET_HEIGHT, width, 0);
+	[window->window setContentSize:NSMakeSize(width, height)];
+}
+
+bool _UIMessageLoopSingle(int *result) {
+	// TODO Modal dialog support.
+	return false;
+}
+
+void UIWindowPostMessage(UIWindow *window, UIMessage _message, void *dp) {
+	_UIPostedMessage *message = (_UIPostedMessage *) UI_MALLOC(sizeof(_UIPostedMessage));
+	message->message = _message;
+	message->dp = dp;
+	[(UICocoaMainView*)window->view performSelectorOnMainThread:@selector(handlePostedMessage:) withObject:(id)message waitUntilDone:NO];
+}
+
+int UICocoaMain(int argc, char **argv, int (*appMain)(int, char **)) {
+	_cocoaArgc = argc, _cocoaArgv = argv, _cocoaAppMain = appMain;
+	NSApplication *application = [NSApplication sharedApplication];
+	application.delegate = [[UICocoaApplicationDelegate alloc] init];
+	return NSApplicationMain(argc, (const char **) argv);
 }
 
 #endif

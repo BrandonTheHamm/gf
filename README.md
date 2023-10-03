@@ -17,10 +17,22 @@ git clone https://github.com/nakst/gf.git
 And compile the application.
 
 ```bash
+# linux
 ./build.sh
+
+# freebsd
+./build_freebsd.sh
+
+# netbsd
+./build_netbsd.sh
+
+# openbsd
+./build_openbsd.sh
 ```
 
 Please read the rest of this file to learn about using and configuring `gf`. If you're new to GDB, see [this article](https://handmade.network/forums/articles/t/2883-gdb).
+
+If you want to make a debug build of `gf`, use a command like `g++ gf2.cpp -g -lX11 -pthread`.
 
 ## Tips
 
@@ -32,6 +44,13 @@ Please read the rest of this file to learn about using and configuring `gf`. If 
 - Press Tab while entering a watch expression to auto-complete it.
 - Press `/` with a watch expression highlighted to change the format specifier. For example, `/x` switches to hexadecimal view.
 - Press backtick to enter line inspect mode. This mode evaluates all expressions on the current line.
+- Use `gf2 --rr-replay` for replaying a trace recorded by [rr](https://rr-project.org/). Use Ctrl+Shift+(F5/F10/F11) for reverse continue and step.
+
+You may want to add the following commands to your `~/.gdbinit` file:
+```
+set breakpoint pending on
+set disassembly-flavor intel
+```
 
 ## Settings
 
@@ -43,8 +62,7 @@ You can pass additional arguments to GDB in the `[gdb]` section. For example,
 
 ```ini
 [gdb]
-argument=-nx
-argument=-ex record
+arguments=-nx -ex record
 ```
 
 You can also change the location of the GDB executable. For example,
@@ -64,8 +82,16 @@ log_all_output=1
 You can disable the confirmation dialogs for the kill (F3) and connect (F4) commands.
 
 ```ini
+[gdb]
 confirm_command_kill=0
 confirm_command_connect=0
+```
+
+You can limit the number of stack frames in the stack window (the default is 50).
+
+```ini
+[gdb]
+backtrace_count_limit=50
 ```
 
 ### Custom keyboard shortcuts

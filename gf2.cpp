@@ -10,6 +10,7 @@
 
 // TODO More data visualization tools in the data window.
 
+#include <stdint.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <signal.h>
@@ -23,16 +24,18 @@
 #include <poll.h>
 #include <time.h>
 
+#ifdef __APPLE__
+#include <sys/syslimits.h>
+#define UI_COCOA
+#else
+#define UI_LINUX
+#endif
+
 extern "C" {
 #define UI_FONT_PATH
-#define UI_LINUX
 #define UI_IMPLEMENTATION
 #include "luigi2.h"
 }
-
-#define MSG_RECEIVED_DATA ((UIMessage) (UI_MSG_USER + 1))
-#define MSG_RECEIVED_CONTROL ((UIMessage) (UI_MSG_USER + 2))
-#define MSG_RECEIVED_LOG ((UIMessage) (UI_MSG_USER + 3))
 
 // Data structures:
 
@@ -53,9 +56,20 @@ struct Array {
 		memcpy(array + index, newItems, newCount * sizeof(T));
 	}
 
-	void Delete(uintptr_t index, size_t count = 1) { 
-		memmove(array + index, array + index + count, (length - index - count) * sizeof(T)); 
+	void Delete(uintptr_t index, size_t count = 1) {
+		memmove(array + index, array + index + count, (length - index - count) * sizeof(T));
 		length -= count;
+	}
+
+	bool Contains(T item, uintptr_t *index) {
+		for (uintptr_t i = 0; i < length; i++) {
+			if (array[i] == item) {
+				if (index) *index = i;
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	void Insert(T item, uintptr_t index) { InsertMany(&item, index, 1); }
@@ -69,16 +83,16 @@ struct Array {
 	void DeleteSwap(uintptr_t index) { if (index != length - 1) array[index] = Last(); Pop(); }
 };
 
+uint64_t Hash(const uint8_t *key, size_t keyBytes) {
+	uint64_t hash = 0xCBF29CE484222325;
+	for (uintptr_t i = 0; i < keyBytes; i++) hash = (hash ^ key[i]) * 0x100000001B3;
+	return hash;
+}
+
 template <class K, class V>
 struct MapShort {
 	struct { K key; V value; } *array;
 	size_t used, capacity;
-
-	uint64_t Hash(uint8_t *key, size_t keyBytes) {
-		uint64_t hash = 0xCBF29CE484222325;
-		for (uintptr_t i = 0; i < keyBytes; i++) hash = (hash ^ key[i]) * 0x100000001B3;
-		return hash;
-	}
 
 	V *At(K key, bool createIfNeeded) {
 		if (used + 1 > capacity / 2) {
@@ -126,6 +140,7 @@ struct InterfaceWindow {
 	void (*focus)(UIElement *element);
 	UIElement *element;
 	bool queuedUpdate, alwaysUpdate;
+	void (*config)(const char *key, const char *value);
 };
 
 struct InterfaceDataViewer {
@@ -136,6 +151,11 @@ struct InterfaceDataViewer {
 struct INIState {
 	char *buffer, *section, *key, *value;
 	size_t bytes, sectionBytes, keyBytes, valueBytes;
+};
+
+struct ReceiveMessageType {
+	UIMessage message;
+	void (*callback)(char *input);
 };
 
 FILE *commandLog;
@@ -154,6 +174,7 @@ bool executableAskDirectory = true;
 Array<InterfaceWindow> interfaceWindows;
 Array<InterfaceCommand> interfaceCommands;
 Array<InterfaceDataViewer> interfaceDataViewers;
+Array<ReceiveMessageType> receiveMessageTypes;
 char *layoutString = (char *) "v(75,h(80,Source,v(50,t(Exe,Breakpoints,Commands,Struct),t(Stack,Files,Thread))),h(65,Console,t(Watch,Locals,Registers,Data)))";
 const char *fontPath;
 int fontSizeCode = 13;
@@ -163,6 +184,8 @@ bool restoreWatchWindow;
 struct WatchWindow *firstWatchWindow;
 bool maximize;
 bool confirmCommandConnect = true, confirmCommandKill = true;
+int backtraceCountLimit = 50;
+UIMessage msgReceivedData, msgReceivedLog, msgReceivedControl, msgReceivedNext = (UIMessage) (UI_MSG_USER + 1);
 
 // Current file and line:
 
@@ -191,10 +214,15 @@ UIFont *fontCode;
 // Breakpoints:
 
 struct Breakpoint {
+	int number;
 	char file[PATH_MAX];
 	char fileFull[PATH_MAX];
 	int line;
-	int watchpoint;
+	bool watchpoint;
+	int hit;
+	bool enabled;
+	char condition[128];
+	uint64_t conditionHash;
 };
 
 Array<Breakpoint> breakpoints;
@@ -368,8 +396,8 @@ bool INIParse(INIState *s) {
 	while (s->bytes) {
 		char c = *s->buffer;
 
-		if (c == ' ' || c == '\n' || c == '\r') { 
-			s->buffer++, s->bytes--; 
+		if (c == ' ' || c == '\n' || c == '\r') {
+			s->buffer++, s->bytes--;
 			continue;
 		} else if (c == ';') {
 			s->valueBytes = 0;
@@ -478,7 +506,7 @@ bool SourceFindOuterFunctionCall(char **start, char **end) {
 
 	// Look backwards for the start of the function name.
 	// TODO Support function pointers.
-	
+
 	while (offset > 0) {
 		char c = displayCode->content[offset];
 
@@ -493,6 +521,12 @@ bool SourceFindOuterFunctionCall(char **start, char **end) {
 	}
 
 	return found;
+}
+
+UIMessage ReceiveMessageRegister(void (*callback)(char *input)) {
+	receiveMessageTypes.Add({ .message = msgReceivedNext, .callback = callback });
+	msgReceivedNext = (UIMessage) (msgReceivedNext + 1);
+	return receiveMessageTypes.Last().message;
 }
 
 //////////////////////////////////////////////////////
@@ -515,6 +549,7 @@ const char *gdbPath = "egdb";
 const char *gdbPath = "gdb";
 #endif
 
+char initialGDBCommand[8192] = "set prompt (gdb) \n";
 bool firstUpdate = true;
 void *sendAllGDBOutputToLogWindowContext;
 
@@ -523,9 +558,9 @@ void *DebuggerThread(void *) {
 	pipe(outputPipe);
 	pipe(inputPipe);
 
-#if defined(__FreeBSD__) || defined(__OpenBSD__)
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
 	gdbPID = fork();
-	
+
 	if(gdbPID == 0) {
 		setsid();
 		dup2(inputPipe[0],  0);
@@ -561,8 +596,7 @@ void *DebuggerThread(void *) {
 
 	pipeToGDB = inputPipe[1];
 
-	const char *setPrompt = "set prompt (gdb) \n";
-	write(pipeToGDB, setPrompt, strlen(setPrompt));
+	write(pipeToGDB, initialGDBCommand, strlen(initialGDBCommand));
 
 	char *catBuffer = NULL;
 	size_t catBufferUsed = 0;
@@ -578,7 +612,7 @@ void *DebuggerThread(void *) {
 			void *message = malloc(count + sizeof(sendAllGDBOutputToLogWindowContext) + 1);
 			memcpy(message, &sendAllGDBOutputToLogWindowContext, sizeof(sendAllGDBOutputToLogWindowContext));
 			strcpy((char *) message + sizeof(sendAllGDBOutputToLogWindowContext), buffer);
-			UIWindowPostMessage(windowMain, MSG_RECEIVED_LOG, message);
+			UIWindowPostMessage(windowMain, msgReceivedLog, message);
 		}
 
 		size_t neededSpace = catBufferUsed + count + 1;
@@ -605,7 +639,7 @@ void *DebuggerThread(void *) {
 			pthread_cond_signal(&evaluateEvent);
 			pthread_mutex_unlock(&evaluateMutex);
 		} else {
-			UIWindowPostMessage(windowMain, MSG_RECEIVED_DATA, catBuffer);
+			UIWindowPostMessage(windowMain, msgReceivedData, catBuffer);
 		}
 
 		catBuffer = NULL;
@@ -699,7 +733,7 @@ void *ControlPipeThread(void *) {
 		FILE *file = fopen(controlPipePath, "rb");
 		char input[256];
 		input[fread(input, 1, sizeof(input) - 1, file)] = 0;
-		UIWindowPostMessage(windowMain, MSG_RECEIVED_CONTROL, strdup(input));
+		UIWindowPostMessage(windowMain, msgReceivedControl, strdup(input));
 		fclose(file);
 	}
 
@@ -707,7 +741,9 @@ void *ControlPipeThread(void *) {
 }
 
 void DebuggerGetStack() {
-	EvaluateCommand("bt 50");
+	char buffer[16];
+	StringFormat(buffer, sizeof(buffer), "bt %d", backtraceCountLimit);
+	EvaluateCommand(buffer);
 	stack.Free();
 
 	const char *position = evaluateResult;
@@ -773,6 +809,11 @@ void DebuggerGetBreakpoints() {
 
 		const char *next = position;
 
+		int number = atoi(position);
+
+		const char *enabledString = strstr(next + 1, " y ");
+		bool enabled = enabledString && enabledString < strchr(next + 1, '\n');
+
 		while (true) {
 			next = strchr(next + 1, '\n');
 			if (!next || isdigit(next[1])) break;
@@ -784,7 +825,27 @@ void DebuggerGetBreakpoints() {
 		if (file) file += 4;
 
 		Breakpoint breakpoint = {};
+		breakpoint.number = number;
+		breakpoint.enabled = enabled;
+
 		bool recognised = true;
+
+		const char *condition = strstr(position, "stop only if ");
+
+		if (condition && condition < next) {
+			const char *end = strchr(condition, '\n');
+			condition += 13;
+			StringFormat(breakpoint.condition, sizeof(breakpoint.condition), "%.*s", (int) (end - condition), condition);
+			breakpoint.conditionHash = Hash((const uint8_t *) condition, end - condition);
+		}
+
+		const char *hitCountNeedle = "breakpoint already hit";
+		const char *hitCount = strstr(position, hitCountNeedle);
+		if (hitCount) hitCount += strlen(hitCountNeedle);
+
+		if (hitCount && hitCount < next) {
+			breakpoint.hit = atoi(hitCount);
+		}
 
 		if (file && file < next) {
 			const char *end = strchr(file, ':');
@@ -798,17 +859,30 @@ void DebuggerGetBreakpoints() {
 
 		if (recognised) {
 			realpath(breakpoint.file, breakpoint.fileFull);
+
+			for (int i = 0; i < breakpoints.Length(); i++) {
+				if (strcmp(breakpoints[i].fileFull, breakpoint.fileFull) == 0
+						&& breakpoints[i].conditionHash == breakpoint.conditionHash
+						&& breakpoints[i].line == breakpoint.line) {
+					// Prevent having identical breakpoints on the same line.
+					char buffer[1024];
+					StringFormat(buffer, 1024, "delete %d", breakpoint.number);
+					DebuggerSend(buffer, true, true);
+					goto doNext;
+				}
+			}
+
 			breakpoints.Add(breakpoint);
 		} else {
 			if (!strstr(position, "watchpoint")) goto doNext;
-			const char *address = strstr(position, " y  ");
+			const char *address = strstr(position, enabled ? " y  " : " n  ");
 			if (!address) goto doNext;
 			address += 2;
 			while (*address == ' ') address++;
 			if (isspace(*address)) goto doNext;
 			const char *end = strchr(address, '\n');
 			if (!end) goto doNext;
-			breakpoint.watchpoint = atoi(position + 1);
+			breakpoint.watchpoint = true;
 			snprintf(breakpoint.file, sizeof(breakpoint.file), "%.*s", (int) (end - address), address);
 			breakpoints.Add(breakpoint);
 		}
@@ -966,14 +1040,18 @@ void CommandSendToGDB(void *_string) {
 	CommandParseInternal((const char *) _string, false);
 }
 
-void CommandDeleteBreakpoint(void *_index) {
-	int index = (int) (intptr_t) _index;
-	Breakpoint *breakpoint = &breakpoints[index];
-	char buffer[1024];
-	if (breakpoint->watchpoint) StringFormat(buffer, 1024, "delete %d", breakpoint->watchpoint);
-	else StringFormat(buffer, 1024, "clear %s:%d", breakpoint->file, breakpoint->line);
-	DebuggerSend(buffer, true, false);
+#define BREAKPOINT_COMMAND(function, action) \
+void function(void *_index) { \
+	int index = (int) (intptr_t) _index; \
+	Breakpoint *breakpoint = &breakpoints[index]; \
+	char buffer[1024]; \
+	StringFormat(buffer, 1024, action " %d", breakpoint->number); \
+	DebuggerSend(buffer, true, false); \
 }
+
+BREAKPOINT_COMMAND(CommandDeleteBreakpoint, "delete");
+BREAKPOINT_COMMAND(CommandDisableBreakpoint, "disable");
+BREAKPOINT_COMMAND(CommandEnableBreakpoint, "enable");
 
 void CommandPause(void *) {
 	kill(gdbPID, SIGINT);
@@ -1220,6 +1298,43 @@ void SettingsLoad(bool earlyPass) {
 					gdbArgv = (char **) realloc(gdbArgv, sizeof(char *) * (gdbArgc + 1));
 					gdbArgv[gdbArgc - 1] = state.value;
 					gdbArgv[gdbArgc] = nullptr;
+				} else if (0 == strcmp(state.key, "arguments")) {
+					char buffer[2048];
+
+					for (size_t i = 0; i < state.valueBytes; i++) {
+						if (isspace(state.value[i])) {
+							continue;
+						}
+
+						size_t argumentStart = 0;
+						size_t argumentEnd = 0;
+
+						if (state.value[i] == '\"') {
+							i++;
+							argumentStart = i;
+							for (; i < state.valueBytes && state.value[i] != '\"'; i++);
+							argumentEnd = i;
+							i++;
+						} else if (state.value[i] == '\'') {
+							i++;
+							argumentStart = i;
+							for (; i < state.valueBytes && state.value[i] != '\''; i++);
+							argumentEnd = i;
+							i++;
+						} else {
+							argumentStart = i;
+							i++;
+							for (; i < state.valueBytes && (state.value[i] != '\'' && state.value[i] != '\"' && !isspace(state.value[i])); i++);
+							argumentEnd = i;
+						}
+
+						StringFormat(buffer, sizeof(buffer), "%.*s", argumentEnd - argumentStart, &state.value[argumentStart]);
+
+						gdbArgc++;
+						gdbArgv = (char **) realloc(gdbArgv, sizeof(char *) * (gdbArgc + 1));
+						gdbArgv[gdbArgc - 1] = strdup(buffer);
+						gdbArgv[gdbArgc] = nullptr;
+					}
 				} else if (0 == strcmp(state.key, "path")) {
 					gdbPath = state.value;
 				} else if (0 == strcmp(state.key, "log_all_output") && atoi(state.value)) {
@@ -1239,6 +1354,8 @@ void SettingsLoad(bool earlyPass) {
 					confirmCommandKill = atoi(state.value);
 				} else if (0 == strcmp(state.key, "confirm_command_connect")) {
 					confirmCommandConnect = atoi(state.value);
+				} else if (0 == strcmp(state.key, "backtrace_count_limit")) {
+					backtraceCountLimit = atoi(state.value);
 				}
 			} else if (0 == strcmp(state.section, "commands") && earlyPass && state.keyBytes && state.valueBytes) {
 				presetCommands.Add(state);
@@ -1267,6 +1384,14 @@ void SettingsLoad(bool earlyPass) {
 				} else if (0 == strcmp(state.key, "ask_directory")) {
 					executableAskDirectory = atoi(state.value);
 				}
+			} else if (earlyPass && *state.section && *state.key && *state.value) {
+				for (int i = 0; i < interfaceWindows.Length(); i++) {
+					if (0 == strcmp(state.section, interfaceWindows[i].name)
+							&& interfaceWindows[i].config) {
+						interfaceWindows[i].config(state.key, state.value);
+						break;
+					}
+				}
 			}
 		}
 	}
@@ -1290,7 +1415,76 @@ void SettingsLoad(bool earlyPass) {
 // Interface and main:
 //////////////////////////////////////////////////////
 
-__attribute__((constructor)) 
+bool ElementHidden(UIElement *element) {
+	while (element) {
+		if (element->flags & UI_ELEMENT_HIDE) {
+			return true;
+		} else {
+			element = element->parent;
+		}
+	}
+
+	return false;
+}
+
+void MsgReceivedData(char *input) {
+	programRunning = false;
+
+	if (firstUpdate) {
+		EvaluateCommand(pythonCode);
+
+		char path[PATH_MAX];
+		StringFormat(path, sizeof(path), "%s/.config/gf2_watch.txt", getenv("HOME"));
+		char *data = LoadFile(path, NULL);
+
+		while (data && restoreWatchWindow) {
+			char *end = strchr(data, '\n');
+			if (!end) break;
+			*end = 0;
+			WatchAddExpression2(data);
+			data = end + 1;
+		}
+
+		firstUpdate = false;
+	}
+
+	if (WatchLoggerUpdate(input)) return;
+	if (showingDisassembly) DisassemblyUpdateLine();
+
+	DebuggerGetStack();
+	DebuggerGetBreakpoints();
+
+	for (int i = 0; i < interfaceWindows.Length(); i++) {
+		InterfaceWindow *window = &interfaceWindows[i];
+		if (!window->update || !window->element) continue;
+		if (!window->alwaysUpdate && ElementHidden(window->element)) window->queuedUpdate = true;
+		else window->update(input, window->element);
+	}
+
+	DataViewersUpdateAll();
+
+	if (displayOutput) {
+		UICodeInsertContent(displayOutput, input, -1, false);
+		UIElementRefresh(&displayOutput->e);
+	}
+
+	if (trafficLight) UIElementRepaint(&trafficLight->e, nullptr);
+}
+
+void MsgReceivedControl(char *input) {
+	char *end = strchr(input, '\n');
+	if (end) *end = 0;
+
+	if (input[0] == 'f' && input[1] == ' ') {
+		DisplaySetPosition(input + 2, 1, false);
+	} else if (input[0] == 'l' && input[1] == ' ') {
+		DisplaySetPosition(nullptr, atoi(input + 2), false);
+	} else if (input[0] == 'c' && input[1] == ' ') {
+		CommandParseInternal(input + 2, false);
+	}
+}
+
+__attribute__((constructor))
 void InterfaceAddBuiltinWindowsAndCommands() {
 	interfaceWindows.Add({ "Stack", StackWindowCreate, StackWindowUpdate });
 	interfaceWindows.Add({ "Source", SourceWindowCreate, SourceWindowUpdate });
@@ -1309,52 +1503,68 @@ void InterfaceAddBuiltinWindowsAndCommands() {
 
 	interfaceDataViewers.Add({ "Add bitmap...", BitmapAddDialog });
 
-	interfaceCommands.Add({ .label = "Run\tShift+F5", 
+	interfaceCommands.Add({ .label = "Run\tShift+F5",
 			{ .code = UI_KEYCODE_FKEY(5), .shift = true, .invoke = CommandSendToGDB, .cp = (void *) "r" } });
-	interfaceCommands.Add({ .label = "Run paused\tCtrl+F5", 
+	interfaceCommands.Add({ .label = "Run paused\tCtrl+F5",
 			{ .code = UI_KEYCODE_FKEY(5), .ctrl = true, .invoke = CommandSendToGDB, .cp = (void *) "start" } });
-	interfaceCommands.Add({ .label = "Kill\tF3", 
+	interfaceCommands.Add({ .label = "Kill\tF3",
 			{ .code = UI_KEYCODE_FKEY(3), .invoke = CommandSendToGDB, .cp = (void *) "kill" } });
-	interfaceCommands.Add({ .label = "Restart GDB\tCtrl+R", 
+	interfaceCommands.Add({ .label = "Restart GDB\tCtrl+R",
 			{ .code = UI_KEYCODE_LETTER('R'), .ctrl = true, .invoke = CommandSendToGDB, .cp = (void *) "gf-restart-gdb" } });
-	interfaceCommands.Add({ .label = "Connect\tF4", 
+	interfaceCommands.Add({ .label = "Connect\tF4",
 			{ .code = UI_KEYCODE_FKEY(4), .invoke = CommandSendToGDB, .cp = (void *) "target remote :1234" } });
-	interfaceCommands.Add({ .label = "Continue\tF5", 
+	interfaceCommands.Add({ .label = "Continue\tF5",
 			{ .code = UI_KEYCODE_FKEY(5), .invoke = CommandSendToGDB, .cp = (void *) "c" } });
-	interfaceCommands.Add({ .label = "Step over\tF10", 
+	interfaceCommands.Add({ .label = "Step over\tF10",
 			{ .code = UI_KEYCODE_FKEY(10), .invoke = CommandSendToGDB, .cp = (void *) "gf-next" } });
-	interfaceCommands.Add({ .label = "Step out of block\tShift+F10", 
+	interfaceCommands.Add({ .label = "Step out of block\tShift+F10",
 			{ .code = UI_KEYCODE_FKEY(10), .shift = true, .invoke = CommandSendToGDB, .cp = (void *) "gf-step-out-of-block" } });
-	interfaceCommands.Add({ .label = "Step in\tF11", 
+	interfaceCommands.Add({ .label = "Step in\tF11",
 			{ .code = UI_KEYCODE_FKEY(11), .invoke = CommandSendToGDB, .cp = (void *) "gf-step" } });
-	interfaceCommands.Add({ .label = "Step into outer\tShift+F8", 
+	interfaceCommands.Add({ .label = "Step into outer\tShift+F8",
 			{ .code = UI_KEYCODE_FKEY(8), .shift = true, .invoke = CommandSendToGDB, .cp = (void *) "gf-step-into-outer" } });
-	interfaceCommands.Add({ .label = "Step out\tShift+F11", 
+	interfaceCommands.Add({ .label = "Step out\tShift+F11",
 			{ .code = UI_KEYCODE_FKEY(11), .shift = true, .invoke = CommandSendToGDB, .cp = (void *) "finish" } });
-	interfaceCommands.Add({ .label = "Pause\tF8", 
+	interfaceCommands.Add({ .label = "Reverse continue\tCtrl+Shift+F5",
+			{ .code = UI_KEYCODE_FKEY(5), .ctrl = true, .shift = true, .invoke = CommandSendToGDB, .cp = (void *) "reverse-continue" } });
+	interfaceCommands.Add({ .label = "Reverse step over\tCtrl+Shift+F10",
+			{ .code = UI_KEYCODE_FKEY(10), .ctrl = true, .shift = true, .invoke = CommandSendToGDB, .cp = (void *) "reverse-next" } });
+	interfaceCommands.Add({ .label = "Reverse step in\tCtrl+Shift+F11",
+			{ .code = UI_KEYCODE_FKEY(11), .ctrl = true, .shift = true, .invoke = CommandSendToGDB, .cp = (void *) "reverse-step" } });
+	interfaceCommands.Add({ .label = "Pause\tF8",
 			{ .code = UI_KEYCODE_FKEY(8), .invoke = CommandPause } });
-	interfaceCommands.Add({ .label = "Toggle breakpoint\tF9", 
+	interfaceCommands.Add({ .label = "Toggle breakpoint\tF9",
 			{ .code = UI_KEYCODE_FKEY(9), .invoke = CommandToggleBreakpoint } });
-	interfaceCommands.Add({ .label = "Sync with gvim\tF2", 
+	interfaceCommands.Add({ .label = "Sync with gvim\tF2",
 			{ .code = UI_KEYCODE_FKEY(2), .invoke = CommandSyncWithGvim } });
-	interfaceCommands.Add({ .label = "Ask GDB for PWD\tCtrl+Shift+P", 
+	interfaceCommands.Add({ .label = "Ask GDB for PWD\tCtrl+Shift+P",
 			{ .code = UI_KEYCODE_LETTER('P'), .ctrl = true, .shift = true, .invoke = CommandSendToGDB, .cp = (void *) "gf-get-pwd" } });
-	interfaceCommands.Add({ .label = "Toggle disassembly\tCtrl+D", 
+	interfaceCommands.Add({ .label = "Toggle disassembly\tCtrl+D",
 			{ .code = UI_KEYCODE_LETTER('D'), .ctrl = true, .invoke = CommandToggleDisassembly } });
-	interfaceCommands.Add({ .label = "Set disassembly mode\tCtrl+M", 
+	interfaceCommands.Add({ .label = "Set disassembly mode\tCtrl+M",
 			{ .code = UI_KEYCODE_LETTER('M'), .ctrl = true, .invoke = CommandSetDisassemblyMode } });
-	interfaceCommands.Add({ .label = "Add watch", 
+	interfaceCommands.Add({ .label = "Add watch",
 			{ .invoke = CommandAddWatch } });
-	interfaceCommands.Add({ .label = "Inspect line", 
-			{ .code = XK_grave, .invoke = CommandInspectLine } });
+	interfaceCommands.Add({ .label = "Inspect line",
+			{ .code = UI_KEYCODE_BACKTICK, .invoke = CommandInspectLine } });
 	interfaceCommands.Add({ .label = nullptr,
 			{ .code = UI_KEYCODE_LETTER('E'), .ctrl = true, .invoke = CommandWatchAddEntryForAddress } });
-	interfaceCommands.Add({ .label = nullptr, 
+	interfaceCommands.Add({ .label = nullptr,
 			{ .code = UI_KEYCODE_LETTER('G'), .ctrl = true, .invoke = CommandWatchViewSourceAtAddress } });
-	interfaceCommands.Add({ .label = nullptr, 
+	interfaceCommands.Add({ .label = nullptr,
 			{ .code = UI_KEYCODE_LETTER('B'), .ctrl = true, .invoke = CommandToggleFillDataTab } });
-	interfaceCommands.Add({ .label = "Donate", 
+	interfaceCommands.Add({ .label = nullptr,
+			{ .code = UI_KEYCODE_LETTER('P'), .ctrl = true, .shift = false, .invoke = CommandPreviousCommand } });
+	interfaceCommands.Add({ .label = nullptr,
+			{ .code = UI_KEYCODE_LETTER('N'), .ctrl = true, .shift = false, .invoke = CommandNextCommand } });
+	interfaceCommands.Add({ .label = nullptr,
+			{ .code = UI_KEYCODE_LETTER('L'), .ctrl = true, .shift = false, .invoke = CommandClearOutput } });
+	interfaceCommands.Add({ .label = "Donate",
 			{ .invoke = CommandDonate } });
+
+	msgReceivedData = ReceiveMessageRegister(MsgReceivedData);
+	msgReceivedControl = ReceiveMessageRegister(MsgReceivedControl);
+	msgReceivedLog = ReceiveMessageRegister(LogReceived);
 }
 
 void InterfaceShowMenu(void *self) {
@@ -1401,83 +1611,16 @@ UIElement *InterfaceWindowSwitchToAndFocus(const char *name) {
 	return nullptr;
 }
 
-bool ElementHidden(UIElement *element) {
-	while (element) {
-		if (element->flags & UI_ELEMENT_HIDE) {
-			return true;
-		} else {
-			element = element->parent;
-		}
-	}
-
-	return false;
-}
-
 int WindowMessage(UIElement *, UIMessage message, int di, void *dp) {
-	if (message == MSG_RECEIVED_DATA) {
-		programRunning = false;
-		char *input = (char *) dp;
-
-		if (firstUpdate) {
-			EvaluateCommand(pythonCode);
-
-			char path[PATH_MAX];
-			StringFormat(path, sizeof(path), "%s/.config/gf2_watch.txt", getenv("HOME"));
-			char *data = LoadFile(path, NULL);
-
-			while (data && restoreWatchWindow) {
-				char *end = strchr(data, '\n');
-				if (!end) break;
-				*end = 0;
-				WatchAddExpression2(data);
-				data = end + 1;
-			}
-
-			firstUpdate = false;
-		}
-
-		if (WatchLoggerUpdate(input)) goto skip;
-		if (showingDisassembly) DisassemblyUpdateLine();
-
-		DebuggerGetStack();
-		DebuggerGetBreakpoints();
-
-		for (int i = 0; i < interfaceWindows.Length(); i++) {
-			InterfaceWindow *window = &interfaceWindows[i];
-			if (!window->update || !window->element) continue;
-			if (!window->alwaysUpdate && ElementHidden(window->element)) window->queuedUpdate = true;
-			else window->update(input, window->element);
-		}
-
-		DataViewersUpdateAll();
-
-		if (displayOutput) {
-			UICodeInsertContent(displayOutput, input, -1, false);
-			UIElementRefresh(&displayOutput->e);
-		}
-
-		if (trafficLight) UIElementRepaint(&trafficLight->e, nullptr);
-
-		skip:;
-		free(input);
-	} else if (message == MSG_RECEIVED_CONTROL) {
-		char *input = (char *) dp;
-		char *end = strchr(input, '\n');
-		if (end) *end = 0;
-
-		if (input[0] == 'f' && input[1] == ' ') {
-			DisplaySetPosition(input + 2, 1, false);
-		} else if (input[0] == 'l' && input[1] == ' ') {
-			DisplaySetPosition(nullptr, atoi(input + 2), false);
-		} else if (input[0] == 'c' && input[1] == ' ') {
-			CommandParseInternal(input + 2, false);
-		}
-
-		free(input);
-	} else if (message == MSG_RECEIVED_LOG) {
-		LogReceived(dp);
-	} else if (message == UI_MSG_WINDOW_ACTIVATE) {
+	if (message == UI_MSG_WINDOW_ACTIVATE) {
 		DisplaySetPosition(currentFileFull, currentLine, false);
+	} else {
+		for (int i = 0; i < receiveMessageTypes.Length(); i++) {
+			if (receiveMessageTypes[i].message == message) {
+				receiveMessageTypes[i].callback((char *) dp);
+				break;
+			}
+		}
 	}
 
 	return 0;
@@ -1493,6 +1636,7 @@ int InterfaceTabPaneMessage(UIElement *element, UIMessage message, int di, void 
 			if (window->element && (~window->element->flags & UI_ELEMENT_HIDE) && window->queuedUpdate) {
 				window->queuedUpdate = false;
 				window->update("", window->element);
+				UIElementMove(window->element, window->element->bounds, false);
 			}
 		}
 
@@ -1594,7 +1738,7 @@ void InterfaceLayoutCreate(UIElement *parent) {
 		for (int i = 0; i < interfaceWindows.Length(); i++) {
 			InterfaceWindow *w = &interfaceWindows[i];
 
-			if (0 == strcmp(token, w->name)) { 
+			if (0 == strcmp(token, w->name)) {
 				w->element = w->create(parent);
 				found = true;
 				break;
@@ -1608,11 +1752,12 @@ void InterfaceLayoutCreate(UIElement *parent) {
 	}
 }
 
-int main(int argc, char **argv) {
+int GfMain(int argc, char **argv) {
 	if (argc == 2 && (0 == strcmp(argv[1], "-?") || 0 == strcmp(argv[1], "-h") || 0 == strcmp(argv[1], "--help"))) {
-		fprintf(stderr, "Usage: %s [GDB ARGS]\n\n"
-			        "GDB ARGS: Pass any gdb arguments here, they will be forwarded to gdb.\n\nFor more information, view the README.md (https://github.com/nakst/gf/blob/master/README.md).\n", argv[0]);
-		return 0;
+		fprintf(stderr, "Usage: %s [GDB args]\n\n"
+			        "GDB args: Pass any GDB arguments here, they will be forwarded to GDB.\n\n"
+				"For more information, view the README at https://github.com/nakst/gf/blob/master/README.md.\n", argv[0]);
+		return 1;
 	}
 
 	struct sigaction sigintHandler = {};
@@ -1623,6 +1768,12 @@ int main(int argc, char **argv) {
 	gdbArgv[0] = (char *) "gdb";
 	memcpy(gdbArgv + 1, argv + 1, sizeof(argv) * argc);
 	gdbArgc = argc;
+
+	if (argc >= 2 && 0 == strcmp(argv[1], "--rr-replay")) {
+		gdbArgv[0] = (char *) "rr";
+		gdbArgv[1] = (char *) "replay";
+		gdbPath = "rr";
+	}
 
 	getcwd(localConfigDirectory, sizeof(localConfigDirectory));
 	StringFormat(globalConfigPath, sizeof(globalConfigPath), "%s/.config/gf2_config.ini", getenv("HOME"));
@@ -1674,6 +1825,18 @@ int main(int argc, char **argv) {
 	pthread_mutex_init(&evaluateMutex, nullptr);
 	DebuggerStartThread();
 	CommandSyncWithGvim(nullptr);
+	return 0;
+}
+
+#ifdef UI_COCOA
+int main(int argc, char **argv) {
+	return UICocoaMain(argc, argv, GfMain);
+}
+#else
+int main(int argc, char **argv) {
+	int code = GfMain(argc, argv);
+	if (code) return code;
+
 	UIMessageLoop();
 	DebuggerClose();
 
@@ -1685,6 +1848,8 @@ int main(int argc, char **argv) {
 			for (int i = 0; i < firstWatchWindow->baseExpressions.Length(); i++) {
 				fprintf(f, "%s\n", firstWatchWindow->baseExpressions[i]->key);
 			}
+
+		        fclose(f);
 		} else {
 			fprintf(stderr, "Warning: Could not save the contents of the watch window; '%s' was not accessible.\n", globalConfigPath);
 		}
@@ -1692,3 +1857,4 @@ int main(int argc, char **argv) {
 
 	return 0;
 }
+#endif
