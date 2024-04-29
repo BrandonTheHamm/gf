@@ -10,6 +10,9 @@ int autoPrintResultLine;
 int currentEndOfBlock;
 int lastCursorX, lastCursorY;
 
+int ifConditionEvaluation, ifConditionLine;
+int ifConditionFrom, ifConditionTo;
+
 Array<char *> inspectResults;
 bool noInspectResults;
 bool inInspectLineMode;
@@ -282,13 +285,15 @@ DISPLAY_CODE_COMMAND_FOR_ALL_BREAKPOINTS_ON_LINE(CommandDisableAllBreakpointsOnL
 DISPLAY_CODE_COMMAND_FOR_ALL_BREAKPOINTS_ON_LINE(CommandEnableAllBreakpointsOnLine,  CommandEnableBreakpoint );
 
 int DisplayCodeMessage(UIElement *element, UIMessage message, int di, void *dp) {
-	if (message == UI_MSG_CLICKED && !showingDisassembly) {
-		int result = UICodeHitTest((UICode *) element, element->window->cursorX, element->window->cursorY);
+	UICode *code = (UICode *) element;
 
-		if (result < 0) {
+	if (message == UI_MSG_CLICKED && !showingDisassembly) {
+		int result = UICodeHitTest(code, element->window->cursorX, element->window->cursorY);
+
+		if (result < 0 && code->leftDownInMargin) {
 			int line = -result;
 			CommandToggleBreakpoint((void *) (intptr_t) line);
-		} else if (result > 0) {
+		} else if (result > 0 && !code->leftDownInMargin) {
 			int line = result;
 
 			if (element->window->ctrl) {
@@ -304,7 +309,7 @@ int DisplayCodeMessage(UIElement *element, UIMessage message, int di, void *dp) 
 			}
 		}
 	} else if (message == UI_MSG_RIGHT_DOWN && !showingDisassembly) {
-		int result = UICodeHitTest((UICode *) element, element->window->cursorX, element->window->cursorY);
+		int result = UICodeHitTest(code, element->window->cursorX, element->window->cursorY);
 
 		bool atLeastOneBreakpointEnabled = false;
 
@@ -330,19 +335,19 @@ int DisplayCodeMessage(UIElement *element, UIMessage message, int di, void *dp) 
 
 		for (int i = 0; i < breakpoints.Length(); i++) {
 			if (breakpoints[i].line == di && 0 == strcmp(breakpoints[i].fileFull, currentFileFull)) {
-				if (breakpoints[i].enabled) return 0xFF0000;
+				if (breakpoints[i].enabled) return ui.theme.accent1;
 				else atLeastOneBreakpointDisabled = true;
 			}
 		}
 
 		if (atLeastOneBreakpointDisabled) {
-			return 0x822454;
+			return (((ui.theme.accent1 & 0xFF0000) >> 1) & 0xFF0000) | (((ui.theme.accent1 & 0xFF00) >> 1) & 0xFF00) | ((ui.theme.accent1 & 0xFF) >> 1);
 		}
 	} else if (message == UI_MSG_PAINT) {
 		element->messageClass(element, message, di, dp);
 
 		if (inInspectLineMode) {
-			UIFont *previousFont = UIFontActivate(((UICode *) element)->font);
+			UIFont *previousFont = UIFontActivate(code->font);
 			DisplayCodeDrawInspectLineModeOverlay((UIPainter *) dp);
 			UIFontActivate(previousFont);
 		}
@@ -360,13 +365,21 @@ int DisplayCodeMessage(UIElement *element, UIMessage message, int di, void *dp) 
 			UIDrawString(m->painter, rectangle, autoPrintResult, -1, ui.theme.codeComment, UI_ALIGN_LEFT, NULL);
 		}
 
-		if (UICodeHitTest((UICode *) element, element->window->cursorX, element->window->cursorY) == m->index
+		if (UICodeHitTest(code, element->window->cursorX, element->window->cursorY) == m->index
 				&& element->window->hovered == element && (element->window->ctrl || element->window->alt || element->window->shift)
 				&& !element->window->textboxModifiedFlag) {
-			UIDrawBorder(m->painter, m->bounds, element->window->ctrl ? 0xFF6290E0 : 0xFFE09062, UI_RECT_1(2));
+			UIDrawBorder(m->painter, m->bounds, element->window->ctrl ? ui.theme.selected : ui.theme.codeOperator, UI_RECT_1(2));
 			UIDrawString(m->painter, m->bounds, element->window->ctrl ? "=> run until " : "=> skip to ", -1, ui.theme.text, UI_ALIGN_RIGHT, NULL);
 		} else if (m->index == currentEndOfBlock) {
 			UIDrawString(m->painter, m->bounds, "[Shift+F10]", -1, ui.theme.codeComment, UI_ALIGN_RIGHT, NULL);
+		}
+
+		if (m->index == ifConditionLine && ifConditionEvaluation) {
+			int columnFrom = _UICodeByteToColumn(code, ifConditionLine - 1, ifConditionFrom);
+			int columnTo = _UICodeByteToColumn(code, ifConditionLine - 1, ifConditionTo);
+			UIDrawBlock(m->painter, UI_RECT_4(m->bounds.l + columnFrom * ui.activeFont->glyphWidth,
+						m->bounds.l + columnTo * ui.activeFont->glyphWidth, m->bounds.b - 2, m->bounds.b), 
+					ifConditionEvaluation == 2 ? ui.theme.accent2 : ui.theme.accent1);
 		}
 	} else if (message == UI_MSG_MOUSE_MOVE || message == UI_MSG_UPDATE) {
 		if (element->window->cursorX != lastCursorX || element->window->cursorY != lastCursorY) {
@@ -382,7 +395,7 @@ int DisplayCodeMessage(UIElement *element, UIMessage message, int di, void *dp) 
 }
 
 UIElement *SourceWindowCreate(UIElement *parent) {
-	displayCode = UICodeCreate(parent, 0);
+	displayCode = UICodeCreate(parent, selectableSource ? UI_CODE_SELECTABLE : 0);
 	displayCode->font = fontCode;
 	displayCode->e.messageUser = DisplayCodeMessage;
 	return &displayCode->e;
@@ -448,7 +461,7 @@ void SourceWindowUpdate(const char *data, UIElement *element) {
 		// Parse the new source line.
 
 		UICodeLine *line = displayCode->lines + currentLine - 1;
-		const char *text = displayCode->content + line->offset;
+		char *text = displayCode->content + line->offset;
 		size_t bytes = line->bytes;
 		uintptr_t position = 0;
 
@@ -505,6 +518,67 @@ void SourceWindowUpdate(const char *data, UIElement *element) {
 		}
 
 		autoPrintExpressionLine = currentLine;
+
+		// Try to evaluate simple if conditions.
+
+		ifConditionEvaluation = 0;
+
+		for (uintptr_t i = 0, phase = 0, expressionStart = 0, depth = 0; i < bytes; i++) {
+			if (phase == 0) {
+				if (text[i] == ' ' || text[i] == '\t' || text[i] == '}') {
+				} else if (i < bytes - 4 && text[i] == 'e' && text[i + 1] == 'l' && text[i + 2] == 's' && text[i + 3] == 'e' && text[i + 4] == ' ') {
+					i += 4;
+				} else if (i < bytes - 2 && text[i] == 'i' && text[i + 1] == 'f' && (text[i + 2] == ' ' || text[i + 2] == '(')) {
+					phase = 1;
+				} else {
+					break;
+				}
+			} else if (phase == 1) {
+				if (text[i] == '(') {
+					phase = 2;
+					expressionStart = i + 1;
+				}
+			} else if (phase == 2) {
+				if (text[i] == '(') {
+					if ((i > 3 && text[i - 3] == '|' && text[i - 2] == '|' && text[i - 1] == ' ')
+							|| (i > 3 && text[i - 3] == '&' && text[i - 2] == '&' && text[i - 1] == ' ')
+							|| (i > 2 && text[i - 2] == '|' && text[i - 1] == '|')
+							|| (i > 2 && text[i - 2] == '&' && text[i - 1] == '&')
+							|| (i > 2 && text[i - 2] == '!' && text[i - 1] == ' ')
+							|| (i > 1 && text[i - 1] == '!')
+							|| (i > 6 && text[i - 6] == 's' && text[i - 5] == 't' && text[i - 4] == 'r' 
+								&& text[i - 3] == 'c' && text[i - 2] == 'm' && text[i - 1] == 'p')) {
+						depth++;
+					} else {
+						// Don't evaluate function calls.
+						break;
+					}
+				} else if (i > 1 && i < bytes - 1 && text[i] == '=' 
+						&& text[i - 1] != '>' && text[i - 1] != '<' && text[i - 1] != '=' && text[i + 1] != '=') {
+					// Don't evaluate assignments.
+					break;
+				} else if (text[i] == ')' && depth) {
+					depth--;
+				} else if (text[i] == ')' && !depth) {
+					text[i] = 0;
+					const char *result = EvaluateExpression(&text[expressionStart]);
+					text[i] = ')';
+
+					if (!result) {
+					} else if (0 == strcmp(result, "= true")) {
+						ifConditionEvaluation = 2;
+						ifConditionFrom = expressionStart, ifConditionTo = i;
+						ifConditionLine = currentLine;
+					} else if (0 == strcmp(result, "= false")) {
+						ifConditionEvaluation = 1;
+						ifConditionFrom = expressionStart, ifConditionTo = i;
+						ifConditionLine = currentLine;
+					}
+
+					break;
+				}
+			}
+		}
 	}
 
 	UIElementRefresh(element);
@@ -956,7 +1030,7 @@ int TextboxInputMessage(UIElement *element, UIMessage message, int di, void *dp)
 
 UIElement *ConsoleWindowCreate(UIElement *parent) {
 	UIPanel *panel2 = UIPanelCreate(parent, UI_PANEL_EXPAND);
-	displayOutput = UICodeCreate(&panel2->e, UI_CODE_NO_MARGIN | UI_ELEMENT_V_FILL);
+	displayOutput = UICodeCreate(&panel2->e, UI_CODE_NO_MARGIN | UI_ELEMENT_V_FILL | UI_CODE_SELECTABLE);
 	UIPanel *panel3 = UIPanelCreate(&panel2->e, UI_PANEL_HORIZONTAL | UI_PANEL_EXPAND | UI_PANEL_COLOR_1);
 	panel3->border = UI_RECT_1(5);
 	panel3->gap = 5;
@@ -1811,7 +1885,7 @@ int WatchWindowMessage(UIElement *element, UIMessage message, int di, void *dp) 
 				if (focused) {
 					UIDrawString(painter, row, buffer, -1, ui.theme.textSelected, UI_ALIGN_LEFT, nullptr);
 				} else {
-					UIDrawStringHighlighted(painter, row, buffer, -1, 1);
+					UIDrawStringHighlighted(painter, row, buffer, -1, 1, NULL);
 				}
 			}
 		}
@@ -2167,6 +2241,17 @@ void CommandAddWatch(void *) {
 // Stack window:
 //////////////////////////////////////////////////////
 
+void StackSetFrame(UIElement *element, int index) {
+	if (index >= 0 && index < ((UITable *) element)->itemCount && stackSelected != index) {
+		char buffer[64];
+		StringFormat(buffer, 64, "frame %d", index);
+		DebuggerSend(buffer, false, false);
+		stackSelected = index;
+		stackChanged = true;
+		UIElementRepaint(element, nullptr);
+	}
+}
+
 int TableStackMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	if (message == UI_MSG_TABLE_GET_ITEM) {
 		UITableGetItem *m = (UITableGetItem *) dp;
@@ -2183,15 +2268,14 @@ int TableStackMessage(UIElement *element, UIMessage message, int di, void *dp) {
 			return StringFormat(m->buffer, m->bufferBytes, "0x%lX", entry->address);
 		}
 	} else if (message == UI_MSG_LEFT_DOWN || message == UI_MSG_MOUSE_DRAG) {
-		int index = UITableHitTest((UITable *) element, element->window->cursorX, element->window->cursorY);
+		StackSetFrame(element, UITableHitTest((UITable *) element, element->window->cursorX, element->window->cursorY));
+	} else if (message == UI_MSG_KEY_TYPED) {
+		UIKeyTyped *m = (UIKeyTyped *) dp;
 
-		if (index != -1 && stackSelected != index) {
-			char buffer[64];
-			StringFormat(buffer, 64, "frame %d", index);
-			DebuggerSend(buffer, false, false);
-			stackSelected = index;
-			stackChanged = true;
-			UIElementRepaint(element, nullptr);
+		if (m->code == UI_KEYCODE_UP || m->code == UI_KEYCODE_DOWN) {
+			StackSetFrame(element, stackSelected + (m->code == UI_KEYCODE_UP ? -1 : 1));
+			// TODO Scroll the row into view if necessary.
+			return 1;
 		}
 	}
 
@@ -2335,6 +2419,13 @@ int TableBreakpointsMessage(UIElement *element, UIMessage message, int di, void 
 		} else if (!element->window->ctrl && !element->window->shift) {
 			data->selected.Free();
 		}
+		UIElementFocus(element);
+	} else if (message == UI_MSG_KEY_TYPED) {
+		UIKeyTyped *m = (UIKeyTyped *) dp;
+
+		if (m->code == UI_KEYCODE_DELETE && data->selected.Length() > 0) {
+			CommandDeleteSelectedBreakpoints(element->cp);
+		}
 	}
 
 	return 0;
@@ -2444,7 +2535,7 @@ UIElement *StructWindowCreate(UIElement *parent) {
 	window->textbox = UITextboxCreate(&panel->e, 0);
 	window->textbox->e.messageUser = TextboxStructNameMessage;
 	window->textbox->e.cp = window;
-	window->display = UICodeCreate(&panel->e, UI_ELEMENT_V_FILL | UI_CODE_NO_MARGIN);
+	window->display = UICodeCreate(&panel->e, UI_ELEMENT_V_FILL | UI_CODE_NO_MARGIN | UI_CODE_SELECTABLE);
 	UICodeInsertContent(window->display, "Type the name of a struct to view its layout.", -1, false);
 	return &panel->e;
 }
@@ -2729,7 +2820,7 @@ void LogReceived(char *buffer) {
 }
 
 UIElement *LogWindowCreate(UIElement *parent) {
-	UICode *code = UICodeCreate(parent, 0);
+	UICode *code = UICodeCreate(parent, UI_CODE_SELECTABLE);
 	pthread_t thread;
 	pthread_create(&thread, nullptr, LogWindowThread, code);
 	return &code->e;
@@ -2904,5 +2995,104 @@ UIElement *ExecutableWindowCreate(UIElement *parent) {
 	button = UIButtonCreate(&row->e, 0, "Save to .project.gf", -1);
 	button->e.cp = window;
 	button->invoke = ExecutableWindowSaveButton;
+	return &panel->e;
+}
+
+//////////////////////////////////////////////////////
+// Command search window:
+//////////////////////////////////////////////////////
+
+struct GDBCommand {
+	char *name;
+	char *description;
+	char *descriptionLower;
+};
+
+struct CommandSearchWindow {
+	UICode *display;
+	UITextbox *textbox;
+	Array<GDBCommand> commands;
+};
+
+int TextboxSearchCommandMessage(UIElement *element, UIMessage message, int di, void *dp) {
+	CommandSearchWindow *window = (CommandSearchWindow *) element->cp;
+
+	if (message == UI_MSG_KEY_TYPED) {
+		if (!window->commands.Length()) {
+			EvaluateCommand("help all");
+
+			for (int i = 0; evaluateResult[i]; i++) {
+				if (evaluateResult[i] == ',' && evaluateResult[i + 1] == ' ' && evaluateResult[i + 2] == '\n') {
+					evaluateResult[i + 2] = ' ';
+				}
+			}
+
+			char *position = evaluateResult;
+
+			while (position) {
+				char *next = strchr(position, '\n');
+				if (!next) break;
+				char *dash = strstr(position, "--");
+
+				if (dash && dash < next && dash > position + 1) {
+					GDBCommand command = {};
+					command.name = (char *) calloc(1, dash - 1 - position + 1);
+
+					for (int i = 0, j = 0; i < dash - 1 - position; i++) {
+						if (position[i] != ' ' || position[i + 1] != ' ') {
+							command.name[j++] = position[i];
+						}
+					}
+
+					command.description = (char *) calloc(1, next - (dash + 3) + 1);
+					command.descriptionLower = (char *) calloc(1, next - (dash + 3) + 1);
+					memcpy(command.description, dash + 3, next - (dash + 3));
+
+					for (int i = 0; command.description[i]; i++) {
+						command.descriptionLower[i] = command.description[i] >= 'A' && command.description[i] <= 'Z' 
+							? command.description[i] + 'a' - 'A' : command.description[i];
+					}
+
+					window->commands.Add(command);
+				}
+
+				position = next + 1;
+			}
+		}
+
+		char query[4096];
+		char buffer[4096];
+		bool firstMatch = true;
+
+		StringFormat(query, sizeof(query), "%.*s", (int) window->textbox->bytes, window->textbox->string);
+		for (int i = 0; query[i]; i++) { query[i] = query[i] >= 'A' && query[i] <= 'Z' ? query[i] + 'a' - 'A' : query[i]; }
+
+		for (int i = 0; i < window->commands.Length(); i++) {
+			if (strstr(window->commands[i].descriptionLower, query)) {
+				StringFormat(buffer, sizeof(buffer), "%s: %s", window->commands[i].name, window->commands[i].description);
+				UICodeInsertContent(window->display, buffer, -1, firstMatch);
+				firstMatch = false;
+			}
+		}
+
+		if (firstMatch) {
+			UICodeInsertContent(window->display, "(no matches)", -1, firstMatch);
+		}
+
+		window->display->vScroll->position = 0;
+		UIElementRefresh(&window->display->e);
+	}
+
+	return 0;
+}
+
+UIElement *CommandSearchWindowCreate(UIElement *parent) {
+	CommandSearchWindow *window = (CommandSearchWindow *) calloc(1, sizeof(CommandSearchWindow));
+	UIPanel *panel = UIPanelCreate(parent, UI_PANEL_COLOR_1 | UI_PANEL_EXPAND);
+	window->textbox = UITextboxCreate(&panel->e, 0);
+	window->textbox->e.messageUser = TextboxSearchCommandMessage;
+	window->textbox->e.cp = window;
+	window->display = UICodeCreate(&panel->e, UI_ELEMENT_V_FILL | UI_CODE_NO_MARGIN | UI_CODE_SELECTABLE);
+	UICodeInsertContent(window->display, "Type here to search \nGDB command descriptions.", -1, true);
 	return &panel->e;
 }

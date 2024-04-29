@@ -175,11 +175,12 @@ Array<InterfaceWindow> interfaceWindows;
 Array<InterfaceCommand> interfaceCommands;
 Array<InterfaceDataViewer> interfaceDataViewers;
 Array<ReceiveMessageType> receiveMessageTypes;
-char *layoutString = (char *) "v(75,h(80,Source,v(50,t(Exe,Breakpoints,Commands,Struct),t(Stack,Files,Thread))),h(65,Console,t(Watch,Locals,Registers,Data)))";
+char *layoutString = (char *) "v(75,h(80,Source,v(50,t(Exe,Breakpoints,Commands,Struct),t(Stack,Files,Thread,CmdSearch))),h(65,Console,t(Watch,Locals,Registers,Data)))";
 const char *fontPath;
 int fontSizeCode = 13;
 int fontSizeInterface = 11;
 float uiScale = 1;
+bool selectableSource;
 bool restoreWatchWindow;
 struct WatchWindow *firstWatchWindow;
 bool maximize;
@@ -423,7 +424,7 @@ bool INIParse(INIState *s) {
 
 int ModifiedRowMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	if (message == UI_MSG_PAINT) {
-		UIDrawBorder((UIPainter *) dp, element->bounds, 0x00FF00, UI_RECT_1(2));
+		UIDrawBorder((UIPainter *) dp, element->bounds, ui.theme.selected, UI_RECT_1(2));
 	}
 
 	return 0;
@@ -431,7 +432,7 @@ int ModifiedRowMessage(UIElement *element, UIMessage message, int di, void *dp) 
 
 int TrafficLightMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	if (message == UI_MSG_PAINT) {
-		UIDrawRectangle((UIPainter *) dp, element->bounds, programRunning ? 0xFF0000 : 0x00FF00, ui.theme.border, UI_RECT_1(1));
+		UIDrawRectangle((UIPainter *) dp, element->bounds, programRunning ? ui.theme.accent1 : ui.theme.accent2, ui.theme.border, UI_RECT_1(1));
 	}
 
 	return 0;
@@ -1157,10 +1158,6 @@ void CommandCustom(void *_command) {
 	}
 }
 
-void CommandDonate(void *) {
-	system("xdg-open https://www.patreon.com/nakst");
-}
-
 //////////////////////////////////////////////////////
 // Settings:
 //////////////////////////////////////////////////////
@@ -1169,6 +1166,7 @@ const char *themeItems[] = {
 	"panel1", "panel2", "selected", "border", "text", "textDisabled", "textSelected",
 	"buttonNormal", "buttonHovered", "buttonPressed", "buttonDisabled", "textboxNormal", "textboxFocused",
 	"codeFocused", "codeBackground", "codeDefault", "codeComment", "codeString", "codeNumber", "codeOperator", "codePreprocessor",
+	"accent1", "accent2",
 };
 
 void SettingsAddTrustedFolder() {
@@ -1291,6 +1289,8 @@ void SettingsLoad(bool earlyPass) {
 					maximize = atoi(state.value);
 				} else if (0 == strcmp(state.key, "restore_watch_window")) {
 					restoreWatchWindow = atoi(state.value);
+				} else if (0 == strcmp(state.key, "selectable_source")) {
+					selectableSource = atoi(state.value);
 				}
 			} else if (0 == strcmp(state.section, "gdb") && !earlyPass) {
 				if (0 == strcmp(state.key, "argument")) {
@@ -1500,6 +1500,7 @@ void InterfaceAddBuiltinWindowsAndCommands() {
 	interfaceWindows.Add({ "Log", LogWindowCreate, nullptr });
 	interfaceWindows.Add({ "Thread", ThreadWindowCreate, ThreadWindowUpdate });
 	interfaceWindows.Add({ "Exe", ExecutableWindowCreate, nullptr });
+	interfaceWindows.Add({ "CmdSearch", CommandSearchWindowCreate, nullptr });
 
 	interfaceDataViewers.Add({ "Add bitmap...", BitmapAddDialog });
 
@@ -1559,8 +1560,6 @@ void InterfaceAddBuiltinWindowsAndCommands() {
 			{ .code = UI_KEYCODE_LETTER('N'), .ctrl = true, .shift = false, .invoke = CommandNextCommand } });
 	interfaceCommands.Add({ .label = nullptr,
 			{ .code = UI_KEYCODE_LETTER('L'), .ctrl = true, .shift = false, .invoke = CommandClearOutput } });
-	interfaceCommands.Add({ .label = "Donate",
-			{ .invoke = CommandDonate } });
 
 	msgReceivedData = ReceiveMessageRegister(MsgReceivedData);
 	msgReceivedControl = ReceiveMessageRegister(MsgReceivedControl);
@@ -1786,7 +1785,7 @@ int GfMain(int argc, char **argv) {
 #ifdef UI_FREETYPE
 	if (!fontPath) {
 		// Ask fontconfig for a monospaced font. If this fails, the fallback font will be used.
-		FILE *f = popen("fc-list | grep `fc-match mono | awk '{ print($1) }'` "
+		FILE *f = popen("fc-list | grep -F `fc-match mono | awk '{ print($1) }'` "
 				"| awk 'BEGIN { FS = \":\" } ; { print($1) }'", "r");
 
 		if (f) {
