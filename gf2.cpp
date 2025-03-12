@@ -44,7 +44,7 @@ struct Array {
 	T *array;
 	size_t length, allocated;
 
-	void InsertMany(T *newItems, uintptr_t index, size_t newCount) {
+	void InsertMany(const T *newItems, uintptr_t index, size_t newCount) {
 		if (length + newCount > allocated) {
 			allocated *= 2;
 			if (length + newCount > allocated) allocated = length + newCount;
@@ -74,6 +74,7 @@ struct Array {
 
 	void Insert(T item, uintptr_t index) { InsertMany(&item, index, 1); }
 	void Add(T item) { Insert(item, length); }
+	void AddMany(const T *newItems, size_t newCount) { InsertMany(newItems, length, newCount); }
 	void Free() { free(array); array = nullptr; length = allocated = 0; }
 	int Length() { return length; }
 	T &First() { return array[0]; }
@@ -180,6 +181,8 @@ const char *fontPath;
 int fontSizeCode = 13;
 int fontSizeInterface = 11;
 float uiScale = 1;
+int uiWidth = 800;
+int uiHeight = 600;
 bool selectableSource;
 bool restoreWatchWindow;
 struct WatchWindow *firstWatchWindow;
@@ -245,6 +248,7 @@ bool stackChanged;
 
 const char *pythonCode = R"(py
 
+import gdb.types
 def _gf_hook_string(basic_type):
     hook_string = str(basic_type)
     template_start = hook_string.find('<')
@@ -343,6 +347,7 @@ UIElement *InterfaceWindowSwitchToAndFocus(const char *name);
 void WatchAddExpression2(char *string);
 int WatchWindowMessage(UIElement *element, UIMessage message, int di, void *dp);
 void CommandInspectLine(void *);
+void CopyLayoutToClipboard(void *cp);
 
 //////////////////////////////////////////////////////
 // Utilities:
@@ -1283,6 +1288,10 @@ void SettingsLoad(bool earlyPass) {
 					fontSizeInterface = atoi(state.value);
 				} else if (0 == strcmp(state.key, "scale")) {
 					uiScale = atof(state.value);
+				} else if (0 == strcmp(state.key, "width")) {
+					uiWidth = atoi(state.value);
+				} else if (0 == strcmp(state.key, "height")) {
+					uiHeight = atoi(state.value);
 				} else if (0 == strcmp(state.key, "layout")) {
 					layoutString = state.value;
 				} else if (0 == strcmp(state.key, "maximize")) {
@@ -1337,6 +1346,7 @@ void SettingsLoad(bool earlyPass) {
 					}
 				} else if (0 == strcmp(state.key, "path")) {
 					gdbPath = state.value;
+                                        gdbArgv[0] = state.value;
 				} else if (0 == strcmp(state.key, "log_all_output") && atoi(state.value)) {
 					for (int i = 0; i < interfaceWindows.Length(); i++) {
 						InterfaceWindow *window = &interfaceWindows[i];
@@ -1548,6 +1558,7 @@ void InterfaceAddBuiltinWindowsAndCommands() {
 			{ .invoke = CommandAddWatch } });
 	interfaceCommands.Add({ .label = "Inspect line",
 			{ .code = UI_KEYCODE_BACKTICK, .invoke = CommandInspectLine } });
+	interfaceCommands.Add({ .label = "Copy Layout to Clipboard", { .invoke = CopyLayoutToClipboard } });
 	interfaceCommands.Add({ .label = nullptr,
 			{ .code = UI_KEYCODE_LETTER('E'), .ctrl = true, .invoke = CommandWatchAddEntryForAddress } });
 	interfaceCommands.Add({ .label = nullptr,
@@ -1560,6 +1571,8 @@ void InterfaceAddBuiltinWindowsAndCommands() {
 			{ .code = UI_KEYCODE_LETTER('N'), .ctrl = true, .shift = false, .invoke = CommandNextCommand } });
 	interfaceCommands.Add({ .label = nullptr,
 			{ .code = UI_KEYCODE_LETTER('L'), .ctrl = true, .shift = false, .invoke = CommandClearOutput } });
+	interfaceCommands.Add({ .label = nullptr,
+			{ .code = UI_KEYCODE_LETTER('U'), .ctrl = true, .shift = false, .invoke = [](void*){ UITextboxClear(textboxInput, false); } } });
 
 	msgReceivedData = ReceiveMessageRegister(MsgReceivedData);
 	msgReceivedControl = ReceiveMessageRegister(MsgReceivedControl);
@@ -1751,6 +1764,60 @@ void InterfaceLayoutCreate(UIElement *parent) {
 	}
 }
 
+void GenerateLayoutString(UIElement *e, Array<char> *sb)
+{
+	char buf[32];
+
+	if (strcmp(e->cClassName, "Split Pane") == 0) {
+		assert(e->childCount == 3);
+		if (e->flags & UI_SPLIT_PANE_VERTICAL) {
+			sb->Add('v');
+		} else {
+			sb->Add('h');
+		}
+		sb->Add('(');
+		int n = snprintf(buf, sizeof(buf), "%d", (int)(((UISplitPane*)e)->weight*100 + 0.5));
+		sb->AddMany(buf, n);
+		sb->Add(',');
+		GenerateLayoutString(e->children[1], sb);
+		sb->Add(',');
+		GenerateLayoutString(e->children[2], sb);
+		sb->Add(')');
+	} else if (strcmp(e->cClassName, "Tab Pane") == 0) {
+		sb->AddMany("t(", 2);
+		for (size_t i = 0; i < e->childCount; ++i) {
+			if (i > 0) sb->Add(',');
+			GenerateLayoutString(e->children[i], sb);
+		}
+		sb->Add(')');
+	} else {
+		for (int i = 0; i < interfaceWindows.Length(); ++i) {
+			InterfaceWindow *window = &interfaceWindows[i];
+			if (window->element != NULL && window->element->id == e->id) {
+				sb->AddMany(window->name, strlen(window->name));
+				return;
+			}
+		}
+		assert(0 && "unreachable");
+	}
+}
+
+void CopyLayoutToClipboard(void *cp)
+{
+	static Array<char> sb; // String Builder
+
+	sb.length = 0;
+	GenerateLayoutString(switcherMain->e.children[0]->children[0], &sb);
+	sb.Add('\0');
+
+	// Copying the text into the memory allocated by the UI allocator, because on some platforms
+	// (like Windows) it is not malloc/free from libc and _UIClipboardWriteText performs UI_FREE
+	// on the text buffer later.
+	char *text = (char*) UI_CALLOC(sb.length);
+	memcpy(text, sb.array, sb.length);
+	_UIClipboardWriteText(windowMain, text);
+}
+
 int GfMain(int argc, char **argv) {
 	if (argc == 2 && (0 == strcmp(argv[1], "-?") || 0 == strcmp(argv[1], "-h") || 0 == strcmp(argv[1], "--help"))) {
 		fprintf(stderr, "Usage: %s [GDB args]\n\n"
@@ -1802,7 +1869,7 @@ int GfMain(int argc, char **argv) {
 	fontCode = UIFontCreate(fontPath, fontSizeCode);
 	UIFontActivate(UIFontCreate(fontPath, fontSizeInterface));
 
-	windowMain = UIWindowCreate(0, maximize ? UI_WINDOW_MAXIMIZE : 0, "gf2", 0, 0);
+	windowMain = UIWindowCreate(0, maximize ? UI_WINDOW_MAXIMIZE : 0, "gf2", uiWidth, uiHeight);
 	windowMain->scale = uiScale;
 	windowMain->e.messageUser = WindowMessage;
 
